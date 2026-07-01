@@ -14,7 +14,7 @@ from openai import OpenAI
 # ============ 配置 ============
 # 在服务器上 export API_KEY=your_key_here 或直接修改下方
 API_BASE = "https://api.v3.cm/v1"
-API_KEY = os.environ.get("API_KEY", "YOUR_API_KEY")
+API_KEY = os.environ.get("API_KEY", "sk-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
 MODEL = "claude-sonnet-5"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
