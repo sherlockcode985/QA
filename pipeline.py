@@ -23,7 +23,7 @@ OVERLAP = 1000
 STRIDE = WINDOW_SIZE - OVERLAP
 
 # --- 并行 ---
-WORKERS = 3            # 并发请求数 (27B 模型建议 2-3)
+WORKERS = 6            # 并发请求数
 MAX_TOKENS_SUMMARIZE = 2048
 MAX_TOKENS_ANSWER = 8192
 MAX_RETRIES = 2
