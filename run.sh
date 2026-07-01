@@ -3,5 +3,5 @@
 cd "$(dirname "$0")"
 [ -d venv ] || python3 -m venv venv
 source venv/bin/activate
-pip install -q openai 2>/dev/null
-python pipeline.py
+python3 -m pip install -q openai 2>/dev/null
+python3 pipeline.py
