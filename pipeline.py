@@ -12,9 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 # ============ 配置 ============
-API_BASE = "http://162.105.19.243:11451/v1"
-API_KEY = "sulab"
-MODEL = "Qwen3.6-27B"
+# 在服务器上 export API_KEY=your_key_here 或直接修改下方
+API_BASE = "https://api.v3.cm/v1"
+API_KEY = os.environ.get("API_KEY", "YOUR_API_KEY")
+MODEL = "claude-sonnet-5"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
 # --- 滑动窗口 ---
@@ -64,7 +65,6 @@ def _call_model(messages: list, max_tokens: int) -> str:
         messages=messages,
         temperature=0.3,
         max_tokens=max_tokens,
-        extra_body={"enable_thinking": False},
     )
     return resp.choices[0].message.content or ""
 
