@@ -85,26 +85,44 @@ PREDICATE_NORMALIZATION = {
 }
 
 # 三元组提取指令（Knowledge Graph Triple: subject || predicate || object）
-TRIPLE_INSTRUCTION = f"""Extract Knowledge Graph triples (S-P-O) representing long-term factual knowledge useful for a character knowledge graph.
+TRIPLE_INSTRUCTION = f"""Extract Knowledge Graph triples representing CHARACTER-LEVEL long-term facts.
 
-FORMAT: subject||predicate||object  (predicate MUST be in the middle)
+FORMAT: subject||predicate||object
 
-RULES:
-1. Use ONLY canonical predicates: {', '.join(sorted(CANONICAL_PREDICATES))}
-2. Subject MUST be a named entity (person, place, organization) — use consistent full canonical names:
-   - Always use the full character name (e.g., "Gabriel Oak" NOT "Gabriel", "Farmer Oak", "shepherd")
-   - Never create new entities for aliases, titles, or descriptive references
-3. Object MUST be a short entity or simple value (person name, place name, item, role, attribute value):
-   - NEVER use full sentences, quotations, dialogue, thoughts, or long descriptions as objects
-   - BAD: Gabriel Oak||THINKS||"I shall never marry..."
-   - BAD: Bathsheba||WEARS||a red cloak on that particular evening
-4. Only extract LONG-TERM facts — do NOT extract:
-   - Temporary actions or one-time events (e.g., carrying a lantern, having dinner)
-   - Scene descriptions, weather, momentary observations
-   - Character internal thoughts, emotions, or psychological states
-   - Unimportant objects or temporary possessions
-   - Quotations or dialogue content
-5. Only extract facts EXPLICITLY stated in the text — do not speculate or infer"""
+CRITICAL — WHAT IS A VALID SUBJECT:
+  A subject MUST be a proper named entity: a specific person (Gabriel Oak), named place (Weatherbury),
+  named organization, or a significant named object. Adjectives, abstract concepts, events, and
+  descriptions are NOT entities — never use them as subjects.
+
+CRITICAL — WHAT IS A VALID OBJECT:
+  - For most predicates: a proper named entity (person, place, item, role)
+  - For HAS_ROLE: a short role/title (Farmer, Shepherd, Servant, Soldier) — NOT a person's name
+  - For HAS_ATTRIBUTE: a SHORT factual value (1-4 words max), e.g. "wealthy", "28 years old", "headstrong"
+    Do NOT use phrases like "general good character" or "clever man in talents" as objects.
+
+FORBIDDEN PATTERNS — NEVER output these:
+  X||ALIAS||X              ← subject and object are identical (worthless)
+  X||HAS_ROLE||X            ← a person is not their own role
+  X||CHILD_OF||X            ← a person is not their own child
+  X||HAS_ROLE||<person>     ← object of HAS_ROLE must be a role, not a person name
+  Gabriel Oak||OWNS||stable ← stable is not a significant named entity
+  X||PARTICIPATES_IN||<generic activity>  ← only NAMED significant events, not "fire at the farm"
+
+PREDICATE USAGE GUIDE:
+  ALIAS:      subject=canonical person name, object=the alias/nickname (e.g., Gabriel Oak||ALIAS||Farmer Oak)
+  HAS_ROLE:   object is a role/title, NOT a person (Gabriel Oak||HAS_ROLE||Shepherd)
+  HAS_ATTRIBUTE: object is 1-4 word factual value (Gabriel Oak||HAS_ATTRIBUTE||28 years old)
+  KNOWS:      two characters who have an established acquaintance (not one-time meetings)
+  LOVES/MARRIES/PROPOSES_TO/REJECTS: romantic relationships
+  FRIEND_OF/RIVALS: social relationships
+  PARENT_OF/CHILD_OF/SIBLING_OF/AUNT_OF/UNCLE_OF: family
+  WORKS_FOR/EMPLOYS: employment
+  LIVES_IN/LOCATED_IN: residence/location
+  OWNS:       significant possessions (farm, house, horse) — not trivial items
+  PARTICIPATES_IN: only NAMED, significant events — not "fire at the farm" or "harvest"
+
+Canonical predicates: {', '.join(sorted(CANONICAL_PREDICATES))}
+Only extract facts EXPLICITLY stated. Be SELECTIVE — quality over quantity."""
 
 # --- 滑动窗口 ---
 WINDOW_SIZE = 4000
@@ -193,22 +211,30 @@ def summarize_one(window_text: str, book_name: str,
     system_prompt = (
         "You are a literary analyst. For the given book section:\n"
         "1. Write a 2-3 sentence summary including key events, characters, and details.\n"
-        "2. Extract Knowledge Graph triples (subject||predicate||object) as instructed below.\n\n"
-        "CRITICAL — Knowledge Graph Triple Rules:\n"
-        f"- Use ONLY these canonical predicates: {rel_list}\n"
-        "- Subject and Object must be named entities. Use consistent FULL canonical names:\n"
-        "  CORRECT: Gabriel Oak || LOVES || Bathsheba Everdene\n"
-        "  WRONG:   Gabriel || LOVES || Bathsheba  (incomplete names)\n"
-        "  WRONG:   the shepherd || LOVES || young woman  (descriptions, not names)\n"
-        "- Object must be a SHORT entity or value — NEVER a sentence, quote, thought, or description.\n"
-        "  WRONG: Gabriel Oak || THINKS || 'I shall never marry...'\n"
-        "  WRONG: Bathsheba || WEARS || a red cloak on that particular evening\n"
-        "- Only extract LONG-TERM factual knowledge. Skip temporary actions, scene details,\n"
-        "  one-time observations, emotions, internal thoughts, and unimportant objects.\n"
-        "- Only extract facts explicitly stated in the text. Do NOT speculate.\n\n"
+        "2. Extract Knowledge Graph triples (subject||predicate||object).\n\n"
+        "=== TRIPLE EXTRACTION RULES (follow strictly) ===\n\n"
+        f"PREDICATES (use ONLY these): {rel_list}\n\n"
+        "VALID SUBJECTS: Only proper named entities — specific people (Gabriel Oak),\n"
+        "  named places (Weatherbury), named organizations. NOT adjectives, emotions,\n"
+        "  abstract concepts, or events.\n\n"
+        "VALID OBJECTS:\n"
+        "  - HAS_ROLE: a short role/title like Farmer, Shepherd, Servant (NOT a person name!)\n"
+        "  - HAS_ATTRIBUTE: 1-4 words max, factual (\"wealthy\", \"28 years old\", \"headstrong\")\n"
+        "    NOT: \"general good character\", \"clever man in talents\", \"fair to Boldwood's workfolk\"\n"
+        "  - ALIAS: the alias/nickname string (Gabriel Oak||ALIAS||Farmer Oak)\n"
+        "  - Other predicates: a proper named entity (person, place, item)\n\n"
+        "FORBIDDEN — SKIP these entirely:\n"
+        "  - Self-referencing: X||ALIAS||X, X||HAS_ROLE||X, X||CHILD_OF||X (subject==object)\n"
+        "  - HAS_ROLE with a person name as object: Gabriel Oak||HAS_ROLE||Baily Pennyways ← WRONG\n"
+        "  - Verbose descriptions as objects: \"quiet and gentle\", \"coolest of the women\"\n"
+        "  - Events as subjects: \"fire at the farm\", \"search for Fanny Robin\"\n"
+        "  - Temporary one-time actions, scene details, internal thoughts, emotional states\n"
+        "  - Trivial possessions: lantern, flute, silver watch, red cloak\n"
+        "  - PARTICIPATES_IN with generic activities (\"fire at the farm\", \"harvest\", \"sheep grazing\")\n"
+        "    Only use PARTICIPATES_IN for NAMED significant events.\n\n"
         "Output format:\n"
         "[SUMMARY]\n<your 2-3 sentence summary>\n[/SUMMARY]\n"
-        "[TRIPLES]\nsubject||predicate||object\nsubject||predicate||object\n[/TRIPLES]\n\n"
+        "[TRIPLES]\nsubject||predicate||object\n[/TRIPLES]\n\n"
         f"Triple extraction guide:\n{TRIPLE_INSTRUCTION}"
     )
     msgs = [
@@ -482,8 +508,42 @@ def _deduplicate_triples(triples: list[dict]) -> list[dict]:
     return unique
 
 
+def _quality_filter(triples: list[dict]) -> list[dict]:
+    """过滤明显低质量的三元组：自引用、属性误认为实体等"""
+    filtered = []
+    removed_self = 0
+    removed_alias_attr = 0
+
+    # 统计：哪些 entity 作为 HAS_ATTRIBUTE 的 object 出现（很可能是属性值而非实体）
+    attr_objects: set[str] = set()
+    for t in triples:
+        if t["predicate"] == "HAS_ATTRIBUTE":
+            attr_objects.add(t["object"])
+
+    for t in triples:
+        subj, pred, obj = t["subject"], t["predicate"], t["object"]
+
+        # 1. 自引用检查
+        if subj == obj:
+            removed_self += 1
+            continue
+
+        # 2. ALIAS 的 subject 是属性值（不是真正实体）
+        if pred == "ALIAS" and subj in attr_objects:
+            removed_alias_attr += 1
+            continue
+
+        filtered.append(t)
+
+    if removed_self:
+        print(f"  [Quality] Removed {removed_self} self-referencing triples (X||P||X).")
+    if removed_alias_attr:
+        print(f"  [Quality] Removed {removed_alias_attr} ALIAS triples with attribute-as-subject.")
+    return filtered
+
+
 def _post_process_triples(triples: list[dict]) -> list[dict]:
-    """三元组后处理管线：谓词统一 → 实体对齐 → 去重"""
+    """三元组后处理管线：谓词统一 → 实体对齐 → 质量过滤 → 去重"""
     if not triples:
         return triples
 
@@ -495,7 +555,10 @@ def _post_process_triples(triples: list[dict]) -> list[dict]:
     # Step 2: 实体对齐 (LLM)
     triples, _ = _canonicalize_entities(triples)
 
-    # Step 3: 去重 + 合并 evidence
+    # Step 3: 质量过滤（自引用、属性实体等）
+    triples = _quality_filter(triples)
+
+    # Step 4: 去重 + 合并 evidence
     triples = _deduplicate_triples(triples)
 
     return triples
