@@ -5,137 +5,36 @@
   1. 滑动窗口切分文本 (sentence-aware)
   2. 并行总结所有窗口 (ThreadPoolExecutor, 按 index 排序拼合)
   3. 后处理三元组: 关系统一 → 实体对齐(LLM) → 去重(合并evidence)
-  4. 汇总所有总结, 基于总结回答问题
+  4. 汇总所有总结, 基于总结回答问题 / 自动生成 QA 对
+
+外部依赖文件（同学主要修改这些）:
+  config.py    — API/模型/窗口/并发参数
+  constants.py — 规范谓词、归一化映射等常量
+  prompts.py   — 所有提示词 & 功能开关（含 ENABLE_QUESTION_INPUT / ENABLE_TRIPLE_INPUT）
 """
 
 import os, re, time, json, threading, csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
-# ============ 配置 ============
-API_BASE = "https://api.v3.cm/v1"
-API_KEY = os.environ.get("API_KEY", "sk-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
-MODEL = "claude-sonnet-5"
-DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
-
-# --- 规范谓词集合（模型只能使用这些 predicate） ---
-CANONICAL_PREDICATES = {
-    "ALIAS", "HAS_ROLE", "HAS_ATTRIBUTE",
-    "LOVES", "MARRIES", "PROPOSES_TO", "REJECTS",
-    "KNOWS", "FRIEND_OF", "RIVALS",
-    "WORKS_FOR", "EMPLOYS",
-    "LIVES_IN", "OWNS",
-    "HAS_FAMILY_RELATION", "PARENT_OF", "CHILD_OF", "SIBLING_OF",
-    "AUNT_OF", "UNCLE_OF",
-    "LOCATED_IN", "VISITS", "PARTICIPATES_IN",
-}
-
-# 自由文本谓词 → 规范谓词映射（兜底归一化）
-PREDICATE_NORMALIZATION = {
-    # 别名
-    "外号": "ALIAS", "别名": "ALIAS", "绰号": "ALIAS", "人称": "ALIAS", "又称": "ALIAS",
-    # 身份 / 属性
-    "身份": "HAS_ROLE", "职位": "HAS_ROLE", "职业": "HAS_ROLE", "是": "HAS_ROLE",
-    "担任": "HAS_ROLE", "成为": "HAS_ROLE", "角色": "HAS_ROLE",
-    "特点": "HAS_ATTRIBUTE", "性格": "HAS_ATTRIBUTE",
-    # 爱慕
-    "爱慕": "LOVES", "喜欢": "LOVES", "爱": "LOVES", "暗恋": "LOVES",
-    "爱慕对象": "LOVES", "被追求": "LOVES", "喜欢的人": "LOVES", "心上人": "LOVES",
-    # 求婚
-    "追求": "PROPOSES_TO", "求婚": "PROPOSES_TO", "求爱": "PROPOSES_TO",
-    # 拒绝
-    "拒绝": "REJECTS", "拒绝求婚": "REJECTS", "拒绝求爱": "REJECTS",
-    # 婚姻
-    "夫妻": "MARRIES", "结婚": "MARRIES", "嫁给": "MARRIES",
-    "娶": "MARRIES", "丈夫": "MARRIES", "妻子": "MARRIES",
-    "未婚妻": "PROPOSES_TO", "未婚夫": "PROPOSES_TO",
-    # 亲属
-    "师徒": "HAS_FAMILY_RELATION", "父亲": "PARENT_OF", "母亲": "PARENT_OF",
-    "儿子": "CHILD_OF", "女儿": "CHILD_OF",
-    "兄弟": "SIBLING_OF", "姐妹": "SIBLING_OF",
-    "叔": "UNCLE_OF", "伯": "UNCLE_OF", "舅": "UNCLE_OF",
-    "姨": "AUNT_OF", "姑": "AUNT_OF",
-    "侄": "HAS_FAMILY_RELATION", "亲属": "HAS_FAMILY_RELATION",
-    "亲戚": "HAS_FAMILY_RELATION", "家人": "HAS_FAMILY_RELATION",
-    # 持有
-    "持有": "OWNS", "拥有": "OWNS", "所属": "OWNS", "拥有者": "OWNS",
-    "主人": "OWNS", "归属": "OWNS",
-    # 雇佣
-    "雇主": "WORKS_FOR", "仆人": "WORKS_FOR", "雇佣": "WORKS_FOR",
-    "员工": "WORKS_FOR", "打工": "WORKS_FOR", "服务": "WORKS_FOR",
-    "雇佣者": "EMPLOYS",
-    # 位置
-    "位于": "LOCATED_IN", "住在": "LIVES_IN", "来自": "LOCATED_IN",
-    "出生地": "LOCATED_IN", "在": "LOCATED_IN",
-    # 社交
-    "认识": "KNOWS", "相识": "KNOWS", "知道": "KNOWS",
-    "朋友": "FRIEND_OF", "好友": "FRIEND_OF",
-    "敌人": "RIVALS", "仇人": "RIVALS", "对手": "RIVALS",
-    # 杀人
-    "杀死": "KILLS", "杀害": "KILLS", "谋杀": "KILLS",
-    # 组织
-    "成员": "MEMBER_OF", "加入": "MEMBER_OF",
-    # 教导
-    "教导": "MENTOR_OF", "老师": "MENTOR_OF", "指导": "MENTOR_OF",
-    "师傅": "MENTOR_OF",
-    # 参与
-    "参加": "PARTICIPATES_IN", "参与": "PARTICIPATES_IN",
-    # 拜访
-    "拜访": "VISITS", "访问": "VISITS",
-}
-
-# 三元组提取指令（Knowledge Graph Triple: subject || predicate || object）
-TRIPLE_INSTRUCTION = f"""Extract Knowledge Graph triples representing CHARACTER-LEVEL long-term facts.
-Be SELECTIVE — 15-25 high-quality triples per section is better than 50 noisy ones.
-
-FORMAT: subject||predicate||object
-
-═══ VALID SUBJECT ═══
-  ONLY proper named entities: a specific person (Gabriel Oak, William Boldwood, not "Boldwood"),
-  named place (Weatherbury, Casterbridge), named organization, or named significant object.
-  NEVER use: adjectives, abstract concepts, events, roles, or descriptions as subjects.
-  WRONG: the maltster || HAS_ATTRIBUTE || very old
-  WRONG: Farm Worker || ALIAS || Farmer
-  RIGHT: maltster's actual name || HAS_ROLE || Maltster
-
-═══ VALID OBJECT by predicate ═══
-  HAS_ROLE:      GENERIC role/title ONLY: Farmer, Shepherd, Servant, Soldier, Bailiff, Maid, Clerk.
-                 NEVER a person's name. WRONG: X||HAS_ROLE||Baily Pennyways; X||HAS_ROLE||Gabriel Oak
-  HAS_ATTRIBUTE: a TRAIT (1-4 words): brave, wealthy, tall, "28 years old", headstrong, handsome.
-                 NEVER a place, organization, role, or person name.
-                 WRONG: X||HAS_ATTRIBUTE||Church of England; X||HAS_ATTRIBUTE||Eleventh Dragoon-Guards Soldier
-  ALIAS:         an alternate name/nickname for the subject. Subject MUST be a person or named place.
-                 WRONG: Farm Worker||ALIAS||Farmer (roles are not entities)
-  OWNS:          significant named possessions only (farm, house, horse, dog). NOT trivial items.
-  KNOWS:         established acquaintances only. If A KNOWS B, do NOT also create B KNOWS A.
-  LIVES_IN:      primary residence only (Gabriel Oak||LIVES_IN||Weatherbury), not temporary stays.
-  PARTICIPATES_IN: NAMED events ONLY: "The Storm", "sheep-shearing", "Greenhill Fair".
-                 NEVER a person. WRONG: Gabriel Oak||PARTICIPATES_IN||Bathsheba Everdene
-                 NEVER a place. WRONG: Gabriel Oak||PARTICIPATES_IN||Casterbridge
-
-═══ FORBIDDEN ═══
-  X||HAS_ROLE||<person name>    ← role objects must be generic roles, never persons
-  X||HAS_ATTRIBUTE||<place/org>  ← attributes are traits, not locations or organizations
-  X||HAS_ATTRIBUTE||<person name> ← attributes are traits, not people
-  <role>||ALIAS||<role variant>  ← roles are not entities, don't create ALIAS for them
-  <description>||ANY||ANY        ← "young girl", "the maltster", "a soldier" are not entities
-  X||KNOWS||Y and Y||KNOWS||X   ← KNOWS is symmetric, only output one direction
-  X||PARTICIPATES_IN||<person>   ← events are not people
-  X||PARTICIPATES_IN||<place>    ← events are not locations
-
-Canonical predicates: {', '.join(sorted(CANONICAL_PREDICATES))}
-Extract only facts EXPLICITLY stated in the text."""
-
-# --- 滑动窗口 ---
-WINDOW_SIZE = 4000
-OVERLAP = 1000
-STRIDE = WINDOW_SIZE - OVERLAP
-
-# --- 并行 ---
-WORKERS = 6
-MAX_TOKENS_SUMMARIZE = 2048
-MAX_TOKENS_ANSWER = 8192
-MAX_RETRIES = 2
+from config import (
+    API_BASE, API_KEY, MODEL, DATA_DIR,
+    WINDOW_SIZE, OVERLAP, STRIDE,
+    WORKERS, MAX_TOKENS_SUMMARIZE, MAX_TOKENS_ANSWER, MAX_RETRIES,
+)
+from constants import (
+    CANONICAL_PREDICATES, PREDICATE_NORMALIZATION, EVENT_DESC_WORDS,
+)
+from prompts import (
+    ENABLE_QUESTION_INPUT,
+    ENABLE_TRIPLE_INPUT,
+    TRIPLE_INSTRUCTION,
+    SUMMARIZE_SYSTEM_PROMPT,
+    ENTITY_CANON_SYSTEM_PROMPT,
+    ENTITY_CANON_USER_PROMPT,
+    ANSWER_SYSTEM_PROMPT,
+    QA_GENERATION_PROMPT,
+)
 
 client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=120.0)
 
@@ -199,7 +98,6 @@ def _parse_response(text: str) -> tuple[str, list[tuple[str, str, str]]]:
             parts = re.split(r'\|\|', line)
             parts = [p.strip() for p in parts if p.strip()]
             if len(parts) >= 3:
-                # subject || predicate || object
                 triples.append((parts[0], parts[1], parts[2]))
 
     if not summary:
@@ -208,42 +106,17 @@ def _parse_response(text: str) -> tuple[str, list[tuple[str, str, str]]]:
     return summary, triples
 
 
+# ============ 窗口总结 ============
+
 def summarize_one(window_text: str, book_name: str,
                   idx: int, total: int) -> tuple[str, list[tuple[str, str, str]]]:
     """总结单个窗口并同步提取三元组（线程安全，可被并行调用）
     返回 (summary, [(subject, predicate, object), ...])"""
     rel_list = ', '.join(sorted(CANONICAL_PREDICATES))
-    system_prompt = (
-        "You are a literary analyst. For the given book section:\n"
-        "1. Write a 2-3 sentence summary including key events, characters, and details.\n"
-        "2. Extract 15-25 high-quality Knowledge Graph triples (subject||predicate||object).\n\n"
-        "=== TRIPLE EXTRACTION RULES (follow strictly) ===\n\n"
-        f"PREDICATES (use ONLY these): {rel_list}\n\n"
-        "═══ SUBJECT — only proper named entities ═══\n"
-        "  RIGHT: Gabriel Oak, William Boldwood, Bathsheba Everdene, Weatherbury\n"
-        "  WRONG: Boldwood (use full name), the maltster (find the name), a soldier (find the name)\n"
-        "  WRONG: 'young girl', 'Liddy's sister', 'the stranger' — descriptions, NOT entities\n"
-        "  Use the MOST COMPLETE name known: William Boldwood, not Boldwood.\n\n"
-        "═══ OBJECT by predicate — what is valid ═══\n"
-        "  HAS_ROLE: GENERIC role ONLY — Farmer, Shepherd, Servant, Soldier, Bailiff, Maid, Clerk.\n"
-        "    WRONG: Gabriel Oak||HAS_ROLE||Baily Pennyways (person, not role)\n"
-        "    WRONG: Cain Ball||HAS_ROLE||Gabriel Oak (person, not role)\n"
-        "  HAS_ATTRIBUTE: a TRAIT (1-4 words) — brave, wealthy, tall, '28 years old', headstrong.\n"
-        "    WRONG: X||HAS_ATTRIBUTE||Church of England (that's a religion/organization)\n"
-        "    WRONG: X||HAS_ATTRIBUTE||Eleventh Dragoon-Guards Soldier (that's a role)\n"
-        "    WRONG: 'clever man in talents', 'observant of stars' (verbose descriptions)\n"
-        "  OWNS: significant named possessions only (farm, house, horse, dog). Skip trivial items.\n"
-        "    NEVER a person: Gabriel Oak||OWNS||Fanny Robin is WRONG.\n"
-        "  KNOWS: established acquaintances. Do NOT create both A||KNOWS||B and B||KNOWS||A.\n"
-        "  ALIAS: alternate name for a person/place. NOT for roles (Farm Worker is a role, not entity).\n"
-        "  PARTICIPATES_IN: NAMED events only. NEVER a person or place name.\n"
-        "    WRONG: Gabriel Oak||PARTICIPATES_IN||Bathsheba Everdene (person, not event)\n"
-        "    RIGHT: Gabriel Oak||PARTICIPATES_IN||The Storm\n"
-        "  HAS_ATTRIBUTE: a TRAIT in 1-4 words. WRONG: 'imposing height and breadth', 'clever man in talents'.\n\n"
-        "Output format:\n"
-        "[SUMMARY]\n<your 2-3 sentence summary>\n[/SUMMARY]\n"
-        "[TRIPLES]\nsubject||predicate||object\n[/TRIPLES]\n\n"
-        f"Triple extraction guide:\n{TRIPLE_INSTRUCTION}"
+    triple_instruction = TRIPLE_INSTRUCTION.format(canonical_predicates=rel_list)
+    system_prompt = SUMMARIZE_SYSTEM_PROMPT.format(
+        rel_list=rel_list,
+        triple_instruction=triple_instruction,
     )
     msgs = [
         {"role": "system", "content": system_prompt},
@@ -267,36 +140,6 @@ def summarize_one(window_text: str, book_name: str,
             print(f"  [Warn] summarize_one failed after {MAX_RETRIES + 1} attempts: {e}")
     return "[summary unavailable]", []
 
-
-# ============ 书籍加载 ============
-
-def load_books(data_dir: str) -> list[dict]:
-    books = []
-    files = sorted(os.listdir(data_dir))
-    for fname in files:
-        if fname.endswith(".cleaned.txt"):
-            path = os.path.join(data_dir, fname)
-            size_kb = os.path.getsize(path) // 1024
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-            if content:
-                windows = sliding_window_chunks(content)
-                books.append({
-                    "name": fname, "size_kb": size_kb,
-                    "chars": len(content),
-                    "est_tokens": len(content) // 4,
-                    "windows": len(windows),
-                })
-    return books
-
-
-def get_book_content(name: str) -> str:
-    path = os.path.join(DATA_DIR, name)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
-
-
-# ============ 并行总结 ============
 
 def summarize_all_parallel(tasks: list[dict], workers: int = WORKERS,
                            resume_path: str | None = None) -> tuple[list[tuple[int, str]], list[dict]]:
@@ -359,6 +202,34 @@ def _save_resume(path: str, done: set, results: dict, triples: list[dict] | None
         json.dump(data, f, ensure_ascii=False)
 
 
+# ============ 书籍加载 ============
+
+def load_books(data_dir: str = DATA_DIR) -> list[dict]:
+    books = []
+    files = sorted(os.listdir(data_dir))
+    for fname in files:
+        if fname.endswith(".cleaned.txt"):
+            path = os.path.join(data_dir, fname)
+            size_kb = os.path.getsize(path) // 1024
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                windows = sliding_window_chunks(content)
+                books.append({
+                    "name": fname, "size_kb": size_kb,
+                    "chars": len(content),
+                    "est_tokens": len(content) // 4,
+                    "windows": len(windows),
+                })
+    return books
+
+
+def get_book_content(name: str) -> str:
+    path = os.path.join(DATA_DIR, name)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
 # ============ 三元组后处理 ============
 
 def _normalize_predicates(triples: list[dict]) -> list[dict]:
@@ -367,12 +238,10 @@ def _normalize_predicates(triples: list[dict]) -> list[dict]:
     dropped = 0
     for t in triples:
         pred = t["predicate"].strip()
-        # 如果已是规范谓词，直接保留
         if pred in CANONICAL_PREDICATES:
             t["predicate"] = pred
             normalized.append(t)
             continue
-        # 尝试通过映射表归一化
         mapped = PREDICATE_NORMALIZATION.get(pred)
         if not mapped:
             upper = pred.upper()
@@ -394,66 +263,22 @@ def _canonicalize_entities(triples: list[dict]) -> tuple[list[dict], dict[str, s
     if not triples:
         return triples, {}
 
-    # 收集所有唯一的实体名（主语和宾语）
     entities: set[str] = set()
     for t in triples:
         entities.add(t["subject"])
         entities.add(t["object"])
 
-    # 过滤掉明显不是人物的实体（纯数字、过短等）
     candidates = sorted(e for e in entities if len(e) >= 2)
 
     if len(candidates) <= 1:
         return triples, {}
 
     entities_text = "\n".join(f"- {e}" for e in candidates)
-    prompt = f"""Here are entity names extracted from a book. Group names that refer to the SAME entity.
-For each group, pick ONE canonical name (the most complete/formal version).
-
-CRITICAL RULES:
-- Surname-only references MUST be merged with the full name if unambiguous:
-  "Boldwood" + "William Boldwood" → canonical: "William Boldwood"
-  "Troy" + "Francis Troy" → canonical: "Francis Troy"
-  ONLY if there are no other characters sharing the surname.
-- Title+variant: "Mr. Boldwood" + "William Boldwood" → canonical: "William Boldwood"
-- First-name-only: "Gabriel" + "Gabriel Oak" → canonical: "Gabriel Oak"
-- Nickname to full: "Cainy Ball" + "Cain Ball" → pick the most consistent form
-- Place aliases: "Weatherbury" + "Little Weatherbury" → canonical: "Weatherbury"
-- DIFFERENT people MUST stay separate. If unsure, keep them separate.
-
-DO NOT GROUP these as entity names — they are EVENTS or DESCRIPTIONS, not entity variants:
-  "Fanny Robin's funeral arrangements" — event, NOT an alias for Fanny Robin
-  "shooting of Francis Troy" — event, NOT an alias for Francis Troy
-  "Valentine Letter Prank" — event, NOT an alias for any character
-  "The Storm" — event, NOT an alias
-  Anything with "'s" (possessive) — NOT a name
-  Anything with "of <name>" — descriptive phrase, NOT a name
-  Sentence-length phrases starting with verbs — NOT names
-
-Entity names:
-{entities_text}
-
-Output format — one group per block:
-[GROUP]
-canonical_name
-alias1
-alias2
-[/GROUP]
-
-For entities with no aliases, list them alone:
-[GROUP]
-canonical_name
-[/GROUP]"""
+    user_prompt = ENTITY_CANON_USER_PROMPT.format(entities_text=entities_text)
 
     msgs = [
-        {"role": "system", "content": "You are an expert at entity resolution for literary texts. "
-         "Group names referring to the same person/place/organization. "
-         "Surname-only references (e.g., 'Boldwood') map to the full name (e.g., 'William Boldwood') "
-         "UNLESS multiple characters share that surname. "
-         "DO NOT group event descriptions, action phrases, or possessive forms as entity names. "
-         "Only real names, nicknames, title variants, and place-name variants should be grouped. "
-         "Output ONLY the [GROUP] blocks, no other text."},
-        {"role": "user", "content": prompt},
+        {"role": "system", "content": ENTITY_CANON_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
     ]
 
     mapping: dict[str, str] = {}
@@ -478,7 +303,6 @@ canonical_name
     if not mapping:
         return triples, {}
 
-    # 应用映射
     alias_triples: list[dict] = []
     for t in triples:
         old_subj = t["subject"]
@@ -487,7 +311,6 @@ canonical_name
         new_obj = mapping.get(old_obj, old_obj)
         t["subject"] = new_subj
         t["object"] = new_obj
-        # 如果 subject 被映射了，生成 ALIAS 三元组
         if new_subj != old_subj:
             alias_triples.append({
                 "subject": new_subj, "predicate": "ALIAS", "object": old_subj,
@@ -499,7 +322,6 @@ canonical_name
                 "book": t["book"], "window": t["window"],
             })
 
-    # 添加 ALIAS 三元组并去重
     seen_alias: set[tuple[str, str, str]] = set()
     for t in alias_triples:
         key = (t["subject"], t["predicate"], t["object"])
@@ -522,7 +344,6 @@ def _deduplicate_triples(triples: list[dict]) -> list[dict]:
     unique: list[dict] = []
     for key, items in groups.items():
         evidence = [f"{it['book']}:{it['window']}" for it in items]
-        # 去重 evidence 并排序
         evidence = sorted(set(evidence), key=lambda x: (x.split(':')[0], int(x.split(':')[1])))
         first = items[0]
         unique.append({
@@ -537,27 +358,6 @@ def _deduplicate_triples(triples: list[dict]) -> list[dict]:
     return unique
 
 
-# ALIAS 对象中不应出现的事件/描述关键词
-_EVENT_DESC_WORDS = {
-    "funeral", "shooting", "burial", "wedding", "marriage", "elopement",
-    "arrangements", "transport", "procession", "search", "pursuit",
-    "conversation", "discussion", "gossip", "dispute", "meeting",
-    "performance", "celebration", "gathering", "supper", "dance", "feast",
-    "journey", "removal", "farewell", "departure", "arrival",
-    "identification", "investigation", "trial", "inquest", "sentencing",
-    "death", "fate", "aftermath", "grave", "coffin", "laying", "laying out",
-    "watch", "clothes", "marker", "gift", "letter", "note",
-    "fire", "storm", "rescue", "fight", "swimming", "drowning",
-    "service", "prayer", "church", "christmas",
-    "race", "fair", "market",
-    "preparations", "planting", "covering", "thatching", "protecting",
-    "theft", "robbery", "disappearance", "escape", "release",
-    "courtship", "courting", "proposal", "engagement",
-    "coronation", "inauguration", "election",
-    "rebellion", "war", "battle", "siege", "invasion",
-}
-
-
 def _quality_filter(triples: list[dict]) -> list[dict]:
     """过滤低质量三元组：自引用、ALIAS事件描述、实体误用为predicate object等"""
     filtered = []
@@ -566,10 +366,9 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
     def _inc(key: str):
         stats[key] = stats.get(key, 0) + 1
 
-    # 收集各类信息
     attr_objects: set[str] = set()
     role_objects: set[str] = set()
-    entity_subjects: set[str] = set()  # 所有作为 subject 出现过的实体名（用于判断 object 是否是人物）
+    entity_subjects: set[str] = set()
 
     for t in triples:
         entity_subjects.add(t["subject"])
@@ -579,22 +378,16 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
             role_objects.add(t["object"])
 
     def _is_bad_alias(obj: str, subj: str) -> bool:
-        """检查ALIAS的object是否像事件描述而非真正的名字"""
-        # 包含所有格 's — 如 "Fanny Robin's funeral arrangements"
         if "'s" in obj or "'s" in obj:
             return True
-        # 超过5个单词 — 不太可能是名字
         if len(obj.split()) > 5:
             return True
-        # 包含 "of <subject>" 模式 — 如 "shooting of Francis Troy"
         if f"of {subj}" in obj.lower():
             return True
-        # 包含事件/描述关键词
         obj_lower = obj.lower()
-        for w in _EVENT_DESC_WORDS:
+        for w in EVENT_DESC_WORDS:
             if w in obj_lower:
                 return True
-        # 以动词-ing开头 — 如 "Watching Eleventh...", "March to..."
         first_word = obj.split()[0].lower() if obj.split() else ""
         if first_word.endswith("ing") and first_word not in ("nothing", "something", "everything"):
             return True
@@ -608,7 +401,7 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
             _inc("self_ref")
             continue
 
-        # 2. ALIAS 的 subject 是属性值或角色值（不是真正实体）
+        # 2. ALIAS 的 subject 是属性值或角色值
         if pred == "ALIAS":
             if subj in attr_objects:
                 _inc("alias_attr_subj")
@@ -616,22 +409,20 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
             if subj in role_objects:
                 _inc("alias_role_subj")
                 continue
-            # ALIAS object 是事件描述而非名字
             if _is_bad_alias(obj, subj):
                 _inc("alias_event_desc")
                 continue
 
-        # 3. PARTICIPATES_IN 的 object 是已知实体（人物/地点），不是事件
+        # 3. PARTICIPATES_IN 的 object 是已知实体
         if pred == "PARTICIPATES_IN":
             if obj in entity_subjects:
                 _inc("participates_entity")
                 continue
-            # object 包含所有格 's — 如 "Fanny Robin's funeral"
             if "'s" in obj:
                 _inc("participates_possessive")
                 continue
 
-        # 4. HAS_ATTRIBUTE 的 object 过长（超过5个单词）或包含所有格
+        # 4. HAS_ATTRIBUTE 的 object 过长或包含所有格
         if pred == "HAS_ATTRIBUTE":
             if len(obj.split()) > 5:
                 _inc("attr_too_long")
@@ -643,19 +434,19 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
                 _inc("attr_possessive")
                 continue
 
-        # 5. HAS_ROLE 的 object 是已知实体（人物名），不是角色
+        # 5. HAS_ROLE 的 object 是已知实体
         if pred == "HAS_ROLE":
             if obj in entity_subjects:
                 _inc("role_is_entity")
                 continue
 
-        # 6. OWNS 的 object 是已知实体（人物名），不是财产
+        # 6. OWNS 的 object 是已知实体
         if pred == "OWNS":
             if obj in entity_subjects:
                 _inc("owns_person")
                 continue
 
-        # 7. LOVES/MARRIES/REJECTS/PROPOSES_TO — object 不应是 "nobody", "soldier" 等非实体
+        # 7. LOVES/MARRIES/REJECTS/PROPOSES_TO — object 不应是模糊实体
         if pred in ("LOVES", "MARRIES", "REJECTS", "PROPOSES_TO", "RIVALS"):
             if obj.lower() in ("nobody", "someone", "soldier", "anyone"):
                 _inc("relation_vague_obj")
@@ -663,7 +454,6 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
 
         filtered.append(t)
 
-    # 汇总日志
     label_map = {
         "self_ref": "self-referencing",
         "alias_attr_subj": "ALIAS with attribute-as-subject",
@@ -692,16 +482,9 @@ def _post_process_triples(triples: list[dict]) -> list[dict]:
 
     print(f"\n  Post-processing {len(triples)} raw triples...")
 
-    # Step 1: 谓词统一
     triples = _normalize_predicates(triples)
-
-    # Step 2: 实体对齐 (LLM)
     triples, _ = _canonicalize_entities(triples)
-
-    # Step 3: 质量过滤（自引用、属性实体等）
     triples = _quality_filter(triples)
-
-    # Step 4: 去重 + 合并 evidence
     triples = _deduplicate_triples(triples)
 
     return triples
@@ -726,7 +509,9 @@ def _save_triples_csv(triples: list[dict]) -> str:
 
 # ============ 主流程 ============
 
-def process_books(selected_names: list[str], question: str,
+def process_books(selected_names: list[str],
+                  question: str | None = None,
+                  triples_guide: str | None = None,
                   resume_path: str | None = None) -> dict:
     t_start = time.time()
     all_tasks = []
@@ -758,19 +543,34 @@ def process_books(selected_names: list[str], question: str,
     if all_triples:
         all_triples = _post_process_triples(all_triples)
 
-    # 最终回答
+    # 最终回答 / QA 生成
     print(f"\n  All {len(summaries)} windows summarized ({len(all_triples)} triples after post-processing).")
-    print(f"  Generating final answer...\n")
 
     summaries_text = "\n\n".join(
         f"[Section {i+1}]\n{s}" for i, s in enumerate(summaries)
     )
-    answer_messages = [
-        {"role": "system", "content": (
-            "You are given section summaries of one or more books. "
-            "Answer based on ALL summaries. Cite sections as evidence.")},
-        {"role": "user", "content": f"Summaries:\n\n{summaries_text}\n\nQuestion: {question}"},
-    ]
+
+    if question:
+        user_content = f"Summaries:\n\n{summaries_text}\n\nQuestion: {question}"
+    else:
+        user_content = f"Summaries:\n\n{summaries_text}"
+
+    if triples_guide:
+        user_content += f"\n\nReference Knowledge Graph triples (use these to guide your output):\n{triples_guide}"
+
+    if question:
+        print(f"  Generating final answer...\n")
+        answer_messages = [
+            {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+    else:
+        print(f"  Generating QA pairs from summaries...\n")
+        answer_messages = [
+            {"role": "system", "content": QA_GENERATION_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
     t0 = time.time()
     answer = _call_model(answer_messages, MAX_TOKENS_ANSWER)
     answer_time = time.time() - t0
@@ -797,7 +597,7 @@ def process_books(selected_names: list[str], question: str,
 # ============ 交互界面 ============
 
 def print_books_table():
-    books = load_books(DATA_DIR)
+    books = load_books()
     print(f"\n  {'Idx':<5} {'Filename':<25} {'Size':<8} {'Chars':<8} {'Windows':<8}")
     print("  " + "-" * 58)
     for i, b in enumerate(books):
@@ -811,10 +611,11 @@ def interactive():
     print(f"Window: {WINDOW_SIZE}ch | Overlap: {OVERLAP}ch")
     print("=" * 60)
 
-    books = load_books(DATA_DIR)
+    books = load_books()
     print(f"\n{len(books)} books available.")
     print_books_table()
 
+    # ── 选择书籍（保留原有逻辑） ──
     print("\nSelect books (indices like 0,1,2 or range 0-5 or 'all'):")
     while True:
         try:
@@ -846,32 +647,67 @@ def interactive():
     print(f"\nSelected {len(selected)} book(s), ~{tw} windows.")
     print(f"Workers: {WORKERS}, estimated: ~{est_parallel // 60} min")
 
-    question = input("\nQuestion: ").strip()
-    if not question:
-        print("Question required.")
-        return
+    # ── 问题输入（可通过 prompts.py 中 ENABLE_QUESTION_INPUT 开关控制） ──
+    question: str | None = None
+    if ENABLE_QUESTION_INPUT:
+        question = input("\nQuestion (press Enter to skip → auto-generate QA pairs): ").strip()
+        if not question:
+            question = None
+            print("  (No question entered, will auto-generate QA pairs from summaries.)")
+    else:
+        print("\n  [Question input disabled — will auto-generate QA pairs from summaries.]")
 
-    proceed = input(f"Proceed? [y/N]: ").strip().lower()
+    # ── 三元组输入（可通过 prompts.py 中 ENABLE_TRIPLE_INPUT 开关控制） ──
+    triples_guide: str | None = None
+    if ENABLE_TRIPLE_INPUT:
+        print("\nEnter reference triples (one per line: subject||predicate||object, empty line to finish):")
+        lines = []
+        while True:
+            line = input().strip()
+            if not line:
+                break
+            lines.append(line)
+        if lines:
+            triples_guide = "\n".join(lines)
+            print(f"  ({len(lines)} reference triples recorded.)")
+        else:
+            print("  (No triples entered.)")
+
+    # ── 确认执行 ──
+    if question:
+        proceed = input(f"\nProceed? [y/N]: ").strip().lower()
+    else:
+        proceed = input(f"\nProceed with auto QA generation? [y/N]: ").strip().lower()
     if proceed != "y":
         print("Cancelled.")
         return
 
     resume_path = os.path.join(os.path.dirname(__file__), "output", ".progress.json")
-    result = process_books(selected, question, resume_path=resume_path)
+    result = process_books(selected, question=question,
+                           triples_guide=triples_guide,
+                           resume_path=resume_path)
 
+    # ── 输出结果 ──
     print(f"\n{'='*60}")
-    print(f"Q: {question}")
+    if question:
+        print(f"Q: {question}")
+    else:
+        print("Auto-generated QA Pairs:")
     print(f"{'='*60}\n")
     print(result["answer"])
     print(f"\n{'='*60}")
     print(f"Time: {result['total_time']:.0f}s | Windows: {result['total_windows']} | Triples: {result.get('triples_count', 0)}")
 
+    # ── 保存结果 ──
     out_dir = os.path.join(os.path.dirname(__file__), "output")
     os.makedirs(out_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(out_dir, f"result_{ts}.txt")
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"Q: {question}\n\nA:\n{result['answer']}\n\n")
+        if question:
+            f.write(f"Q: {question}\n\nA:\n{result['answer']}\n\n")
+        else:
+            f.write(f"Auto-generated QA Pairs:\n\n{result['answer']}\n\n")
         f.write(f"--- Stats ---\n")
         f.write(f"Workers: {WORKERS}\n")
         f.write(f"Windows: {result['total_windows']}\n")
