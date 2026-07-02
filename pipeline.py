@@ -109,14 +109,19 @@ FORMAT: subject||predicate||object
   OWNS:          significant named possessions only (farm, house, horse, dog). NOT trivial items.
   KNOWS:         established acquaintances only. If A KNOWS B, do NOT also create B KNOWS A.
   LIVES_IN:      primary residence only (Gabriel Oak||LIVES_IN||Weatherbury), not temporary stays.
-  PARTICIPATES_IN: NAMED significant events only. NOT generic activities or locations.
+  PARTICIPATES_IN: NAMED events ONLY: "The Storm", "sheep-shearing", "Greenhill Fair".
+                 NEVER a person. WRONG: Gabriel Oak||PARTICIPATES_IN||Bathsheba Everdene
+                 NEVER a place. WRONG: Gabriel Oak||PARTICIPATES_IN||Casterbridge
 
 ═══ FORBIDDEN ═══
   X||HAS_ROLE||<person name>    ← role objects must be generic roles, never persons
   X||HAS_ATTRIBUTE||<place/org>  ← attributes are traits, not locations or organizations
+  X||HAS_ATTRIBUTE||<person name> ← attributes are traits, not people
   <role>||ALIAS||<role variant>  ← roles are not entities, don't create ALIAS for them
   <description>||ANY||ANY        ← "young girl", "the maltster", "a soldier" are not entities
   X||KNOWS||Y and Y||KNOWS||X   ← KNOWS is symmetric, only output one direction
+  X||PARTICIPATES_IN||<person>   ← events are not people
+  X||PARTICIPATES_IN||<place>    ← events are not locations
 
 Canonical predicates: {', '.join(sorted(CANONICAL_PREDICATES))}
 Extract only facts EXPLICITLY stated in the text."""
@@ -225,8 +230,13 @@ def summarize_one(window_text: str, book_name: str,
         "    WRONG: X||HAS_ATTRIBUTE||Eleventh Dragoon-Guards Soldier (that's a role)\n"
         "    WRONG: 'clever man in talents', 'observant of stars' (verbose descriptions)\n"
         "  OWNS: significant named possessions only (farm, house, horse, dog). Skip trivial items.\n"
+        "    NEVER a person: Gabriel Oak||OWNS||Fanny Robin is WRONG.\n"
         "  KNOWS: established acquaintances. Do NOT create both A||KNOWS||B and B||KNOWS||A.\n"
-        "  ALIAS: alternate name for a person/place. NOT for roles (Farm Worker is a role, not entity).\n\n"
+        "  ALIAS: alternate name for a person/place. NOT for roles (Farm Worker is a role, not entity).\n"
+        "  PARTICIPATES_IN: NAMED events only. NEVER a person or place name.\n"
+        "    WRONG: Gabriel Oak||PARTICIPATES_IN||Bathsheba Everdene (person, not event)\n"
+        "    RIGHT: Gabriel Oak||PARTICIPATES_IN||The Storm\n"
+        "  HAS_ATTRIBUTE: a TRAIT in 1-4 words. WRONG: 'imposing height and breadth', 'clever man in talents'.\n\n"
         "Output format:\n"
         "[SUMMARY]\n<your 2-3 sentence summary>\n[/SUMMARY]\n"
         "[TRIPLES]\nsubject||predicate||object\n[/TRIPLES]\n\n"
@@ -399,9 +409,17 @@ CRITICAL RULES:
 - Title+variant: "Mr. Boldwood" + "William Boldwood" → canonical: "William Boldwood"
 - First-name-only: "Gabriel" + "Gabriel Oak" → canonical: "Gabriel Oak"
 - Nickname to full: "Cainy Ball" + "Cain Ball" → pick the most consistent form
-- Descriptive refs ("the shepherd", "the young woman", "a soldier") → map to the character's canonical name if identifiable
 - Place aliases: "Weatherbury" + "Little Weatherbury" → canonical: "Weatherbury"
 - DIFFERENT people MUST stay separate. If unsure, keep them separate.
+
+DO NOT GROUP these as entity names — they are EVENTS or DESCRIPTIONS, not entity variants:
+  "Fanny Robin's funeral arrangements" — event, NOT an alias for Fanny Robin
+  "shooting of Francis Troy" — event, NOT an alias for Francis Troy
+  "Valentine Letter Prank" — event, NOT an alias for any character
+  "The Storm" — event, NOT an alias
+  Anything with "'s" (possessive) — NOT a name
+  Anything with "of <name>" — descriptive phrase, NOT a name
+  Sentence-length phrases starting with verbs — NOT names
 
 Entity names:
 {entities_text}
@@ -423,6 +441,8 @@ canonical_name
          "Group names referring to the same person/place/organization. "
          "Surname-only references (e.g., 'Boldwood') map to the full name (e.g., 'William Boldwood') "
          "UNLESS multiple characters share that surname. "
+         "DO NOT group event descriptions, action phrases, or possessive forms as entity names. "
+         "Only real names, nicknames, title variants, and place-name variants should be grouped. "
          "Output ONLY the [GROUP] blocks, no other text."},
         {"role": "user", "content": prompt},
     ]
@@ -508,49 +528,151 @@ def _deduplicate_triples(triples: list[dict]) -> list[dict]:
     return unique
 
 
-def _quality_filter(triples: list[dict]) -> list[dict]:
-    """过滤明显低质量的三元组：自引用、属性/角色误认为实体、人物名误当role等"""
-    filtered = []
-    removed_self = 0
-    removed_alias_attr = 0
-    removed_alias_role = 0
+# ALIAS 对象中不应出现的事件/描述关键词
+_EVENT_DESC_WORDS = {
+    "funeral", "shooting", "burial", "wedding", "marriage", "elopement",
+    "arrangements", "transport", "procession", "search", "pursuit",
+    "conversation", "discussion", "gossip", "dispute", "meeting",
+    "performance", "celebration", "gathering", "supper", "dance", "feast",
+    "journey", "removal", "farewell", "departure", "arrival",
+    "identification", "investigation", "trial", "inquest", "sentencing",
+    "death", "fate", "aftermath", "grave", "coffin", "laying", "laying out",
+    "watch", "clothes", "marker", "gift", "letter", "note",
+    "fire", "storm", "rescue", "fight", "swimming", "drowning",
+    "service", "prayer", "church", "christmas",
+    "race", "fair", "market",
+    "preparations", "planting", "covering", "thatching", "protecting",
+    "theft", "robbery", "disappearance", "escape", "release",
+    "courtship", "courting", "proposal", "engagement",
+    "coronation", "inauguration", "election",
+    "rebellion", "war", "battle", "siege", "invasion",
+}
 
-    # 收集属性值（HAS_ATTRIBUTE 的 object）——这些不是实体
+
+def _quality_filter(triples: list[dict]) -> list[dict]:
+    """过滤低质量三元组：自引用、ALIAS事件描述、实体误用为predicate object等"""
+    filtered = []
+    stats: dict[str, int] = {}
+
+    def _inc(key: str):
+        stats[key] = stats.get(key, 0) + 1
+
+    # 收集各类信息
     attr_objects: set[str] = set()
-    # 收集角色值（HAS_ROLE 的 object）——这些不是实体
     role_objects: set[str] = set()
+    entity_subjects: set[str] = set()  # 所有作为 subject 出现过的实体名（用于判断 object 是否是人物）
 
     for t in triples:
+        entity_subjects.add(t["subject"])
         if t["predicate"] == "HAS_ATTRIBUTE":
             attr_objects.add(t["object"])
         if t["predicate"] == "HAS_ROLE":
             role_objects.add(t["object"])
 
+    def _is_bad_alias(obj: str, subj: str) -> bool:
+        """检查ALIAS的object是否像事件描述而非真正的名字"""
+        # 包含所有格 's — 如 "Fanny Robin's funeral arrangements"
+        if "'s" in obj or "'s" in obj:
+            return True
+        # 超过5个单词 — 不太可能是名字
+        if len(obj.split()) > 5:
+            return True
+        # 包含 "of <subject>" 模式 — 如 "shooting of Francis Troy"
+        if f"of {subj}" in obj.lower():
+            return True
+        # 包含事件/描述关键词
+        obj_lower = obj.lower()
+        for w in _EVENT_DESC_WORDS:
+            if w in obj_lower:
+                return True
+        # 以动词-ing开头 — 如 "Watching Eleventh...", "March to..."
+        first_word = obj.split()[0].lower() if obj.split() else ""
+        if first_word.endswith("ing") and first_word not in ("nothing", "something", "everything"):
+            return True
+        return False
+
     for t in triples:
         subj, pred, obj = t["subject"], t["predicate"], t["object"]
 
-        # 1. 自引用检查
+        # 1. 自引用
         if subj == obj:
-            removed_self += 1
+            _inc("self_ref")
             continue
 
         # 2. ALIAS 的 subject 是属性值或角色值（不是真正实体）
         if pred == "ALIAS":
             if subj in attr_objects:
-                removed_alias_attr += 1
+                _inc("alias_attr_subj")
                 continue
             if subj in role_objects:
-                removed_alias_role += 1
+                _inc("alias_role_subj")
+                continue
+            # ALIAS object 是事件描述而非名字
+            if _is_bad_alias(obj, subj):
+                _inc("alias_event_desc")
+                continue
+
+        # 3. PARTICIPATES_IN 的 object 是已知实体（人物/地点），不是事件
+        if pred == "PARTICIPATES_IN":
+            if obj in entity_subjects:
+                _inc("participates_entity")
+                continue
+            # object 包含所有格 's — 如 "Fanny Robin's funeral"
+            if "'s" in obj:
+                _inc("participates_possessive")
+                continue
+
+        # 4. HAS_ATTRIBUTE 的 object 过长（超过5个单词）或包含所有格
+        if pred == "HAS_ATTRIBUTE":
+            if len(obj.split()) > 5:
+                _inc("attr_too_long")
+                continue
+            if obj in entity_subjects:
+                _inc("attr_is_entity")
+                continue
+            if "'s" in obj:
+                _inc("attr_possessive")
+                continue
+
+        # 5. HAS_ROLE 的 object 是已知实体（人物名），不是角色
+        if pred == "HAS_ROLE":
+            if obj in entity_subjects:
+                _inc("role_is_entity")
+                continue
+
+        # 6. OWNS 的 object 是已知实体（人物名），不是财产
+        if pred == "OWNS":
+            if obj in entity_subjects:
+                _inc("owns_person")
+                continue
+
+        # 7. LOVES/MARRIES/REJECTS/PROPOSES_TO — object 不应是 "nobody", "soldier" 等非实体
+        if pred in ("LOVES", "MARRIES", "REJECTS", "PROPOSES_TO", "RIVALS"):
+            if obj.lower() in ("nobody", "someone", "soldier", "anyone"):
+                _inc("relation_vague_obj")
                 continue
 
         filtered.append(t)
 
-    if removed_self:
-        print(f"  [Quality] Removed {removed_self} self-referencing triples.")
-    if removed_alias_attr:
-        print(f"  [Quality] Removed {removed_alias_attr} ALIAS triples with attribute-as-subject.")
-    if removed_alias_role:
-        print(f"  [Quality] Removed {removed_alias_role} ALIAS triples with role-as-subject.")
+    # 汇总日志
+    label_map = {
+        "self_ref": "self-referencing",
+        "alias_attr_subj": "ALIAS with attribute-as-subject",
+        "alias_role_subj": "ALIAS with role-as-subject",
+        "alias_event_desc": "ALIAS with event-description object",
+        "participates_entity": "PARTICIPATES_IN with entity-as-event",
+        "participates_possessive": "PARTICIPATES_IN with possessive object",
+        "attr_too_long": "HAS_ATTRIBUTE with >5 word object",
+        "attr_is_entity": "HAS_ATTRIBUTE with entity-as-attribute",
+        "attr_possessive": "HAS_ATTRIBUTE with possessive object",
+        "role_is_entity": "HAS_ROLE with entity-as-role",
+        "owns_person": "OWNS with person-as-possession",
+        "relation_vague_obj": "relation with vague/non-entity object",
+    }
+    for key, label in label_map.items():
+        if key in stats:
+            print(f"  [Quality] Removed {stats[key]} triples: {label}.")
+
     return filtered
 
 
