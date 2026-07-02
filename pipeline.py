@@ -18,6 +18,14 @@ API_KEY = os.environ.get("API_KEY", "sk-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44Ff
 MODEL = "claude-sonnet-5"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
+# --- 三元组提取配置 ---
+# 在此定义需要提取的三元组类型，模型会根据此提示词在总结时同步提取
+TRIPLE_INSTRUCTION = """从文本中提取以下三元组（格式：主体||属性值||关系类型，每行一个）：
+- 人物外号/别名: 如 张三||狗蛋||外号
+- 人物身份/职位: 如 李四||掌门||身份
+- 人物关系: 如 张三||李四||师徒
+- 重要物品归属: 如 屠龙刀||张三||持有"""
+
 # --- 滑动窗口 ---
 WINDOW_SIZE = 4000
 OVERLAP = 1000
@@ -69,25 +77,60 @@ def _call_model(messages: list, max_tokens: int) -> str:
     return resp.choices[0].message.content or ""
 
 
+def _parse_response(text: str) -> tuple[str, list[tuple[str, str, str]]]:
+    """从模型回复中解析 [SUMMARY]...[/SUMMARY] 和 [TRIPLES]...[/TRIPLES] 块"""
+    summary = ""
+    triples: list[tuple[str, str, str]] = []
+
+    sm = re.search(r'\[SUMMARY\]\s*(.*?)\s*\[/SUMMARY\]', text, re.DOTALL | re.IGNORECASE)
+    if sm:
+        summary = sm.group(1).strip()
+
+    tm = re.search(r'\[TRIPLES\]\s*(.*?)\s*\[/TRIPLES\]', text, re.DOTALL | re.IGNORECASE)
+    if tm:
+        for line in tm.group(1).strip().split('\n'):
+            line = line.strip().lstrip('- ').strip()
+            if not line:
+                continue
+            parts = re.split(r'\|\|', line)
+            parts = [p.strip() for p in parts if p.strip()]
+            if len(parts) >= 3:
+                triples.append((parts[0], parts[1], parts[2]))
+
+    if not summary:
+        summary = text.strip()
+
+    return summary, triples
+
+
 def summarize_one(window_text: str, book_name: str,
-                  idx: int, total: int) -> str:
-    """总结单个窗口（线程安全，可被并行调用）"""
+                  idx: int, total: int) -> tuple[str, list[tuple[str, str, str]]]:
+    """总结单个窗口并同步提取三元组（线程安全，可被并行调用）"""
+    system_prompt = (
+        "You are a literary analyst. For the given book section:\n"
+        "1. Write a 2-3 sentence summary including key events, characters, and details.\n"
+        "2. Extract structured triples (entity||attribute||relation_type) as instructed below.\n"
+        "IMPORTANT: Only include triples that are explicitly supported by the text.\n\n"
+        "Output format:\n"
+        "[SUMMARY]\n<your summary here>\n[/SUMMARY]\n"
+        "[TRIPLES]\nentity||attribute||relation\nentity||attribute||relation\n[/TRIPLES]\n\n"
+        f"Triple extraction instructions:\n{TRIPLE_INSTRUCTION}"
+    )
     msgs = [
-        {"role": "system", "content": (
-            "Summarize the book section below in 2-3 sentences. "
-            "Include key events, characters, and details.")},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"[{book_name} | {idx}/{total}]\n{window_text}"},
     ]
     for attempt in range(MAX_RETRIES + 1):
         r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
-        if r.strip():
-            return r.strip()
+        summary, triples = _parse_response(r)
+        if summary:
+            return summary, triples
         if attempt < MAX_RETRIES:
-            msgs[0]["content"] += " Be thorough."
             r = _call_model(msgs, MAX_TOKENS_SUMMARIZE * 2)
-            if r.strip():
-                return r.strip()
-    return "[summary unavailable]"
+            summary, triples = _parse_response(r)
+            if summary:
+                return summary, triples
+    return "[summary unavailable]", []
 
 
 # ============ 书籍加载 ============
@@ -121,62 +164,92 @@ def get_book_content(name: str) -> str:
 # ============ 并行总结 ============
 
 def summarize_all_parallel(tasks: list[dict], workers: int = WORKERS,
-                           resume_path: str | None = None) -> list[tuple[int, str]]:
+                           resume_path: str | None = None) -> tuple[list[tuple[int, str]], list[dict]]:
     """
     tasks: [{global_idx, book_name, text, section_idx, section_total}]
-    返回 [(global_idx, summary)]，已按 global_idx 排序。
+    返回 ([(global_idx, summary)], [triple_dicts])，summary 已按 global_idx 排序。
 
     并行执行，支持进度保存/恢复。
     """
     total = len(tasks)
-    # 恢复已完成的
-    done = set()        # global_idx
+    done: set[int] = set()
     results: dict[int, str] = {}
+    all_triples: list[dict] = []
+
     if resume_path and os.path.exists(resume_path):
         saved = json.load(open(resume_path, "r"))
         done = set(saved.get("done", []))
         results = {int(k): v for k, v in saved.get("results", {}).items()}
         print(f"  Resumed: {len(done)}/{total} windows already done.")
 
-    # 筛选未完成的
     pending = [t for t in tasks if t["global_idx"] not in done]
     lock = threading.Lock()
 
-    def process(t: dict) -> tuple[int, str]:
+    def process(t: dict) -> tuple[int, str, list[tuple[str, str, str]]]:
         idx = t["global_idx"]
-        summary = summarize_one(t["text"], t["book_name"],
-                                t["section_idx"], t["section_total"])
+        summary, triples = summarize_one(t["text"], t["book_name"],
+                                         t["section_idx"], t["section_total"])
         with lock:
             done.add(idx)
             results[idx] = summary
-            # 每完成 10 个保存一次
+            for entity, attr, rel in triples:
+                all_triples.append({
+                    "entity": entity, "attribute": attr, "relation": rel,
+                    "book": t["book_name"], "window": t["section_idx"],
+                })
             if resume_path and len(done) % 10 == 0:
-                _save_resume(resume_path, done, results)
-        return idx, summary
+                _save_resume(resume_path, done, results, all_triples)
+        return idx, summary, triples
 
     if pending:
         print(f"  Processing {len(pending)} windows ({workers} workers)...")
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(process, t): t for t in pending}
             for f in as_completed(futures):
-                idx, _ = f.result()
+                idx, _, _ = f.result()
                 print(f"  [{idx}/{total}] done", flush=True)
 
-    # 最终保存
     if resume_path:
-        _save_resume(resume_path, done, results)
+        _save_resume(resume_path, done, results, all_triples)
 
-    # 按 global_idx 排序返回
-    return sorted(results.items())
+    return sorted(results.items()), all_triples
 
 
-def _save_resume(path: str, done: set, results: dict):
+def _save_resume(path: str, done: set, results: dict, triples: list[dict] | None = None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # 只序列化 int key
     serializable = {str(k): v for k, v in results.items()}
+    data = {"done": sorted(done), "results": serializable}
+    if triples is not None:
+        data["triples_count"] = len(triples)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"done": sorted(done), "results": serializable},
-                  f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False)
+
+
+def _save_triples_csv(triples: list[dict]) -> str:
+    """去重并保存三元组到 CSV 文件"""
+    import csv
+
+    out_dir = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(out_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(out_dir, f"triples_{ts}.csv")
+
+    # 去重（entity + attribute + relation 相同视为重复）
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict] = []
+    for t in triples:
+        key = (t["entity"], t["attribute"], t["relation"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(t)
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["entity", "attribute", "relation", "book", "window"])
+        writer.writeheader()
+        writer.writerows(unique)
+
+    print(f"  Triples: {len(unique)} unique (from {len(triples)} raw)")
+    return csv_path
 
 
 # ============ 主流程 ============
@@ -206,12 +279,12 @@ def process_books(selected_names: list[str], question: str,
         print(f"  [{name}] {section_total} windows")
 
     # 并行总结
-    sorted_results = summarize_all_parallel(all_tasks, WORKERS, resume_path)
+    sorted_results, all_triples = summarize_all_parallel(all_tasks, WORKERS, resume_path)
 
     summaries = [s for _, s in sorted_results]
 
     # 最终回答
-    print(f"\n  All {len(summaries)} windows summarized.")
+    print(f"\n  All {len(summaries)} windows summarized ({len(all_triples)} triples extracted).")
     print(f"  Generating final answer...\n")
 
     summaries_text = "\n\n".join(
@@ -227,6 +300,12 @@ def process_books(selected_names: list[str], question: str,
     answer = _call_model(answer_messages, MAX_TOKENS_ANSWER)
     answer_time = time.time() - t0
 
+    # 去重三元组并输出 CSV
+    csv_path = None
+    if all_triples:
+        csv_path = _save_triples_csv(all_triples)
+        print(f"  Triples saved: {csv_path}")
+
     # 清理进度
     if resume_path and os.path.exists(resume_path):
         os.remove(resume_path)
@@ -236,6 +315,8 @@ def process_books(selected_names: list[str], question: str,
         "total_windows": total_windows,
         "total_time": time.time() - t_start,
         "answer_time": answer_time,
+        "triples_count": len(all_triples),
+        "triples_csv": csv_path,
     }
 
 
@@ -309,7 +390,7 @@ def interactive():
     print(f"{'='*60}\n")
     print(result["answer"])
     print(f"\n{'='*60}")
-    print(f"Time: {result['total_time']:.0f}s | Windows: {result['total_windows']}")
+    print(f"Time: {result['total_time']:.0f}s | Windows: {result['total_windows']} | Triples: {result.get('triples_count', 0)}")
 
     out_dir = os.path.join(os.path.dirname(__file__), "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -321,7 +402,12 @@ def interactive():
         f.write(f"Workers: {WORKERS}\n")
         f.write(f"Windows: {result['total_windows']}\n")
         f.write(f"Total time: {result['total_time']:.0f}s\n")
+        f.write(f"Triples: {result.get('triples_count', 0)}\n")
+        if result.get('triples_csv'):
+            f.write(f"Triples CSV: {result['triples_csv']}\n")
     print(f"\nSaved: {out_path}")
+    if result.get('triples_csv'):
+        print(f"Triples CSV: {result['triples_csv']}")
 
 
 if __name__ == "__main__":
