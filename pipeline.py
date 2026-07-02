@@ -86,43 +86,40 @@ PREDICATE_NORMALIZATION = {
 
 # 三元组提取指令（Knowledge Graph Triple: subject || predicate || object）
 TRIPLE_INSTRUCTION = f"""Extract Knowledge Graph triples representing CHARACTER-LEVEL long-term facts.
+Be SELECTIVE — 15-25 high-quality triples per section is better than 50 noisy ones.
 
 FORMAT: subject||predicate||object
 
-CRITICAL — WHAT IS A VALID SUBJECT:
-  A subject MUST be a proper named entity: a specific person (Gabriel Oak), named place (Weatherbury),
-  named organization, or a significant named object. Adjectives, abstract concepts, events, and
-  descriptions are NOT entities — never use them as subjects.
+═══ VALID SUBJECT ═══
+  ONLY proper named entities: a specific person (Gabriel Oak, William Boldwood, not "Boldwood"),
+  named place (Weatherbury, Casterbridge), named organization, or named significant object.
+  NEVER use: adjectives, abstract concepts, events, roles, or descriptions as subjects.
+  WRONG: the maltster || HAS_ATTRIBUTE || very old
+  WRONG: Farm Worker || ALIAS || Farmer
+  RIGHT: maltster's actual name || HAS_ROLE || Maltster
 
-CRITICAL — WHAT IS A VALID OBJECT:
-  - For most predicates: a proper named entity (person, place, item, role)
-  - For HAS_ROLE: a short role/title (Farmer, Shepherd, Servant, Soldier) — NOT a person's name
-  - For HAS_ATTRIBUTE: a SHORT factual value (1-4 words max), e.g. "wealthy", "28 years old", "headstrong"
-    Do NOT use phrases like "general good character" or "clever man in talents" as objects.
+═══ VALID OBJECT by predicate ═══
+  HAS_ROLE:      GENERIC role/title ONLY: Farmer, Shepherd, Servant, Soldier, Bailiff, Maid, Clerk.
+                 NEVER a person's name. WRONG: X||HAS_ROLE||Baily Pennyways; X||HAS_ROLE||Gabriel Oak
+  HAS_ATTRIBUTE: a TRAIT (1-4 words): brave, wealthy, tall, "28 years old", headstrong, handsome.
+                 NEVER a place, organization, role, or person name.
+                 WRONG: X||HAS_ATTRIBUTE||Church of England; X||HAS_ATTRIBUTE||Eleventh Dragoon-Guards Soldier
+  ALIAS:         an alternate name/nickname for the subject. Subject MUST be a person or named place.
+                 WRONG: Farm Worker||ALIAS||Farmer (roles are not entities)
+  OWNS:          significant named possessions only (farm, house, horse, dog). NOT trivial items.
+  KNOWS:         established acquaintances only. If A KNOWS B, do NOT also create B KNOWS A.
+  LIVES_IN:      primary residence only (Gabriel Oak||LIVES_IN||Weatherbury), not temporary stays.
+  PARTICIPATES_IN: NAMED significant events only. NOT generic activities or locations.
 
-FORBIDDEN PATTERNS — NEVER output these:
-  X||ALIAS||X              ← subject and object are identical (worthless)
-  X||HAS_ROLE||X            ← a person is not their own role
-  X||CHILD_OF||X            ← a person is not their own child
-  X||HAS_ROLE||<person>     ← object of HAS_ROLE must be a role, not a person name
-  Gabriel Oak||OWNS||stable ← stable is not a significant named entity
-  X||PARTICIPATES_IN||<generic activity>  ← only NAMED significant events, not "fire at the farm"
-
-PREDICATE USAGE GUIDE:
-  ALIAS:      subject=canonical person name, object=the alias/nickname (e.g., Gabriel Oak||ALIAS||Farmer Oak)
-  HAS_ROLE:   object is a role/title, NOT a person (Gabriel Oak||HAS_ROLE||Shepherd)
-  HAS_ATTRIBUTE: object is 1-4 word factual value (Gabriel Oak||HAS_ATTRIBUTE||28 years old)
-  KNOWS:      two characters who have an established acquaintance (not one-time meetings)
-  LOVES/MARRIES/PROPOSES_TO/REJECTS: romantic relationships
-  FRIEND_OF/RIVALS: social relationships
-  PARENT_OF/CHILD_OF/SIBLING_OF/AUNT_OF/UNCLE_OF: family
-  WORKS_FOR/EMPLOYS: employment
-  LIVES_IN/LOCATED_IN: residence/location
-  OWNS:       significant possessions (farm, house, horse) — not trivial items
-  PARTICIPATES_IN: only NAMED, significant events — not "fire at the farm" or "harvest"
+═══ FORBIDDEN ═══
+  X||HAS_ROLE||<person name>    ← role objects must be generic roles, never persons
+  X||HAS_ATTRIBUTE||<place/org>  ← attributes are traits, not locations or organizations
+  <role>||ALIAS||<role variant>  ← roles are not entities, don't create ALIAS for them
+  <description>||ANY||ANY        ← "young girl", "the maltster", "a soldier" are not entities
+  X||KNOWS||Y and Y||KNOWS||X   ← KNOWS is symmetric, only output one direction
 
 Canonical predicates: {', '.join(sorted(CANONICAL_PREDICATES))}
-Only extract facts EXPLICITLY stated. Be SELECTIVE — quality over quantity."""
+Extract only facts EXPLICITLY stated in the text."""
 
 # --- 滑动窗口 ---
 WINDOW_SIZE = 4000
@@ -211,27 +208,25 @@ def summarize_one(window_text: str, book_name: str,
     system_prompt = (
         "You are a literary analyst. For the given book section:\n"
         "1. Write a 2-3 sentence summary including key events, characters, and details.\n"
-        "2. Extract Knowledge Graph triples (subject||predicate||object).\n\n"
+        "2. Extract 15-25 high-quality Knowledge Graph triples (subject||predicate||object).\n\n"
         "=== TRIPLE EXTRACTION RULES (follow strictly) ===\n\n"
         f"PREDICATES (use ONLY these): {rel_list}\n\n"
-        "VALID SUBJECTS: Only proper named entities — specific people (Gabriel Oak),\n"
-        "  named places (Weatherbury), named organizations. NOT adjectives, emotions,\n"
-        "  abstract concepts, or events.\n\n"
-        "VALID OBJECTS:\n"
-        "  - HAS_ROLE: a short role/title like Farmer, Shepherd, Servant (NOT a person name!)\n"
-        "  - HAS_ATTRIBUTE: 1-4 words max, factual (\"wealthy\", \"28 years old\", \"headstrong\")\n"
-        "    NOT: \"general good character\", \"clever man in talents\", \"fair to Boldwood's workfolk\"\n"
-        "  - ALIAS: the alias/nickname string (Gabriel Oak||ALIAS||Farmer Oak)\n"
-        "  - Other predicates: a proper named entity (person, place, item)\n\n"
-        "FORBIDDEN — SKIP these entirely:\n"
-        "  - Self-referencing: X||ALIAS||X, X||HAS_ROLE||X, X||CHILD_OF||X (subject==object)\n"
-        "  - HAS_ROLE with a person name as object: Gabriel Oak||HAS_ROLE||Baily Pennyways ← WRONG\n"
-        "  - Verbose descriptions as objects: \"quiet and gentle\", \"coolest of the women\"\n"
-        "  - Events as subjects: \"fire at the farm\", \"search for Fanny Robin\"\n"
-        "  - Temporary one-time actions, scene details, internal thoughts, emotional states\n"
-        "  - Trivial possessions: lantern, flute, silver watch, red cloak\n"
-        "  - PARTICIPATES_IN with generic activities (\"fire at the farm\", \"harvest\", \"sheep grazing\")\n"
-        "    Only use PARTICIPATES_IN for NAMED significant events.\n\n"
+        "═══ SUBJECT — only proper named entities ═══\n"
+        "  RIGHT: Gabriel Oak, William Boldwood, Bathsheba Everdene, Weatherbury\n"
+        "  WRONG: Boldwood (use full name), the maltster (find the name), a soldier (find the name)\n"
+        "  WRONG: 'young girl', 'Liddy's sister', 'the stranger' — descriptions, NOT entities\n"
+        "  Use the MOST COMPLETE name known: William Boldwood, not Boldwood.\n\n"
+        "═══ OBJECT by predicate — what is valid ═══\n"
+        "  HAS_ROLE: GENERIC role ONLY — Farmer, Shepherd, Servant, Soldier, Bailiff, Maid, Clerk.\n"
+        "    WRONG: Gabriel Oak||HAS_ROLE||Baily Pennyways (person, not role)\n"
+        "    WRONG: Cain Ball||HAS_ROLE||Gabriel Oak (person, not role)\n"
+        "  HAS_ATTRIBUTE: a TRAIT (1-4 words) — brave, wealthy, tall, '28 years old', headstrong.\n"
+        "    WRONG: X||HAS_ATTRIBUTE||Church of England (that's a religion/organization)\n"
+        "    WRONG: X||HAS_ATTRIBUTE||Eleventh Dragoon-Guards Soldier (that's a role)\n"
+        "    WRONG: 'clever man in talents', 'observant of stars' (verbose descriptions)\n"
+        "  OWNS: significant named possessions only (farm, house, horse, dog). Skip trivial items.\n"
+        "  KNOWS: established acquaintances. Do NOT create both A||KNOWS||B and B||KNOWS||A.\n"
+        "  ALIAS: alternate name for a person/place. NOT for roles (Farm Worker is a role, not entity).\n\n"
         "Output format:\n"
         "[SUMMARY]\n<your 2-3 sentence summary>\n[/SUMMARY]\n"
         "[TRIPLES]\nsubject||predicate||object\n[/TRIPLES]\n\n"
@@ -394,15 +389,19 @@ def _canonicalize_entities(triples: list[dict]) -> tuple[list[dict], dict[str, s
 
     entities_text = "\n".join(f"- {e}" for e in candidates)
     prompt = f"""Here are entity names extracted from a book. Group names that refer to the SAME entity.
-For each group, pick ONE canonical name (use the most complete/formal version).
+For each group, pick ONE canonical name (the most complete/formal version).
 
-Rules:
-- A person's full name, first name, last name, title+name, and descriptive epithet are the SAME entity
-  Example: "Gabriel Oak", "Gabriel", "Farmer Oak", "Mr. Oak", "Shepherd Oak" → canonical: "Gabriel Oak"
-- Descriptive references ("the shepherd", "a young woman") should map to the character they refer to
-- Different people MUST stay separate — do NOT merge distinct characters
-- If you are unsure whether two names refer to the same person, keep them separate
-- Place names should only be merged if they are truly the same location
+CRITICAL RULES:
+- Surname-only references MUST be merged with the full name if unambiguous:
+  "Boldwood" + "William Boldwood" → canonical: "William Boldwood"
+  "Troy" + "Francis Troy" → canonical: "Francis Troy"
+  ONLY if there are no other characters sharing the surname.
+- Title+variant: "Mr. Boldwood" + "William Boldwood" → canonical: "William Boldwood"
+- First-name-only: "Gabriel" + "Gabriel Oak" → canonical: "Gabriel Oak"
+- Nickname to full: "Cainy Ball" + "Cain Ball" → pick the most consistent form
+- Descriptive refs ("the shepherd", "the young woman", "a soldier") → map to the character's canonical name if identifiable
+- Place aliases: "Weatherbury" + "Little Weatherbury" → canonical: "Weatherbury"
+- DIFFERENT people MUST stay separate. If unsure, keep them separate.
 
 Entity names:
 {entities_text}
@@ -414,15 +413,16 @@ alias1
 alias2
 [/GROUP]
 
-For entities with no aliases, output them alone:
+For entities with no aliases, list them alone:
 [GROUP]
 canonical_name
 [/GROUP]"""
 
     msgs = [
         {"role": "system", "content": "You are an expert at entity resolution for literary texts. "
-         "Group entity names that refer to the same real-world entity (person, place, organization). "
-         "Be conservative — only merge when confident. "
+         "Group names referring to the same person/place/organization. "
+         "Surname-only references (e.g., 'Boldwood') map to the full name (e.g., 'William Boldwood') "
+         "UNLESS multiple characters share that surname. "
          "Output ONLY the [GROUP] blocks, no other text."},
         {"role": "user", "content": prompt},
     ]
@@ -509,16 +509,22 @@ def _deduplicate_triples(triples: list[dict]) -> list[dict]:
 
 
 def _quality_filter(triples: list[dict]) -> list[dict]:
-    """过滤明显低质量的三元组：自引用、属性误认为实体等"""
+    """过滤明显低质量的三元组：自引用、属性/角色误认为实体、人物名误当role等"""
     filtered = []
     removed_self = 0
     removed_alias_attr = 0
+    removed_alias_role = 0
 
-    # 统计：哪些 entity 作为 HAS_ATTRIBUTE 的 object 出现（很可能是属性值而非实体）
+    # 收集属性值（HAS_ATTRIBUTE 的 object）——这些不是实体
     attr_objects: set[str] = set()
+    # 收集角色值（HAS_ROLE 的 object）——这些不是实体
+    role_objects: set[str] = set()
+
     for t in triples:
         if t["predicate"] == "HAS_ATTRIBUTE":
             attr_objects.add(t["object"])
+        if t["predicate"] == "HAS_ROLE":
+            role_objects.add(t["object"])
 
     for t in triples:
         subj, pred, obj = t["subject"], t["predicate"], t["object"]
@@ -528,17 +534,23 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
             removed_self += 1
             continue
 
-        # 2. ALIAS 的 subject 是属性值（不是真正实体）
-        if pred == "ALIAS" and subj in attr_objects:
-            removed_alias_attr += 1
-            continue
+        # 2. ALIAS 的 subject 是属性值或角色值（不是真正实体）
+        if pred == "ALIAS":
+            if subj in attr_objects:
+                removed_alias_attr += 1
+                continue
+            if subj in role_objects:
+                removed_alias_role += 1
+                continue
 
         filtered.append(t)
 
     if removed_self:
-        print(f"  [Quality] Removed {removed_self} self-referencing triples (X||P||X).")
+        print(f"  [Quality] Removed {removed_self} self-referencing triples.")
     if removed_alias_attr:
         print(f"  [Quality] Removed {removed_alias_attr} ALIAS triples with attribute-as-subject.")
+    if removed_alias_role:
+        print(f"  [Quality] Removed {removed_alias_role} ALIAS triples with role-as-subject.")
     return filtered
 
 
