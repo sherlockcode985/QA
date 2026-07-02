@@ -177,7 +177,7 @@ def summarize_all_parallel(tasks: list[dict], workers: int = WORKERS,
     all_triples: list[dict] = []
 
     if resume_path and os.path.exists(resume_path):
-        saved = json.load(open(resume_path, "r"))
+        saved = json.load(open(resume_path, "r", encoding="utf-8"))
         done = set(saved.get("done", []))
         results = {int(k): v for k, v in saved.get("results", {}).items()}
         print(f"  Resumed: {len(done)}/{total} windows already done.")
