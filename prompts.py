@@ -33,87 +33,74 @@ Bathsheba Everdene||LOVES||Gabriel Oak"""
 # ============ 三元组提取指令 ============
 
 # 窗口级三元组提取详细规范，嵌入到 SUMMARIZE_SYSTEM_PROMPT 末尾使用。
-# {canonical_predicates} 会被替换为 CANONICAL_PREDICATES 的排序列表。
-TRIPLE_INSTRUCTION: str = """Extract Knowledge Graph triples representing CHARACTER-LEVEL long-term facts.
-Be SELECTIVE — 15-25 high-quality triples per section is better than 50 noisy ones.
+TRIPLE_INSTRUCTION: str = """THIS PHASE: extract ONLY ALIAS triples. Focus exclusively on entity name variations.
 
-FORMAT: subject||predicate||object
+FORMAT: subject||ALIAS||object
+  subject = the entity's FULL/CANONICAL name
+  object  = an alternate name, nickname, shortened form, or title-based reference
 
-═══ VALID SUBJECT ═══
-  ONLY proper named entities: a specific person (Gabriel Oak, William Boldwood, not "Boldwood"),
-  named place (Weatherbury, Casterbridge), named organization, or named significant object.
-  NEVER use: adjectives, abstract concepts, events, roles, or descriptions as subjects.
-  WRONG: the maltster || HAS_ATTRIBUTE || very old
-  WRONG: Farm Worker || ALIAS || Farmer
-  RIGHT: maltster's actual name || HAS_ROLE || Maltster
+═══ WHAT MAKES A QUALITY ALIAS ═══
 
-═══ VALID OBJECT by predicate ═══
-  HAS_ROLE:      GENERIC role/title ONLY: Farmer, Shepherd, Servant, Soldier, Bailiff, Maid, Clerk.
-                 NEVER a person's name. WRONG: X||HAS_ROLE||Baily Pennyways; X||HAS_ROLE||Gabriel Oak
-  HAS_ATTRIBUTE: a TRAIT (1-4 words): brave, wealthy, tall, "28 years old", headstrong, handsome.
-                 NEVER a place, organization, role, or person name.
-                 WRONG: X||HAS_ATTRIBUTE||Church of England; X||HAS_ATTRIBUTE||Eleventh Dragoon-Guards Soldier
-  ALIAS:         an alternate name/nickname for the subject. Subject MUST be a person or named place.
-                 WRONG: Farm Worker||ALIAS||Farmer (roles are not entities)
-  OWNS:          significant named possessions only (farm, house, horse, dog). NOT trivial items.
-  KNOWS:         established acquaintances only. If A KNOWS B, do NOT also create B KNOWS A.
-  LIVES_IN:      primary residence only (Gabriel Oak||LIVES_IN||Weatherbury), not temporary stays.
-  PARTICIPATES_IN: NAMED events ONLY: "The Storm", "sheep-shearing", "Greenhill Fair".
-                 NEVER a person. WRONG: Gabriel Oak||PARTICIPATES_IN||Bathsheba Everdene
-                 NEVER a place. WRONG: Gabriel Oak||PARTICIPATES_IN||Casterbridge
+A valid ALIAS triple captures that the same person/place is referred to by different names in the text. The subject MUST be the most complete/formal name you can find; the object is the variant.
 
-═══ FORBIDDEN ═══
-  X||HAS_ROLE||<person name>    ← role objects must be generic roles, never persons
-  X||HAS_ATTRIBUTE||<place/org>  ← attributes are traits, not locations or organizations
-  X||HAS_ATTRIBUTE||<person name> ← attributes are traits, not people
-  <role>||ALIAS||<role variant>  ← roles are not entities, don't create ALIAS for them
-  <description>||ANY||ANY        ← "young girl", "the maltster", "a soldier" are not entities
-  X||KNOWS||Y and Y||KNOWS||X   ← KNOWS is symmetric, only output one direction
-  X||PARTICIPATES_IN||<person>   ← events are not people
-  X||PARTICIPATES_IN||<place>    ← events are not locations
+GOOD examples:
+  William Boldwood||ALIAS||Mr. Boldwood       (title + surname → full name)
+  William Boldwood||ALIAS||Boldwood             (surname-only reference)
+  Gabriel Oak||ALIAS||Gabriel                    (first-name-only reference)
+  Gabriel Oak||ALIAS||Farmer Oak               (role + surname variant)
+  Bathsheba Everdene||ALIAS||Bathsheba          (first-name-only reference)
+  Bathsheba Everdene||ALIAS||Miss Everdene      (title + surname)
+  Cain Ball||ALIAS||Cainy Ball                  (nickname)
+  Weatherbury||ALIAS||Little Weatherbury        (place name variant)
 
-Canonical predicates: {canonical_predicates}
-Extract only facts EXPLICITLY stated in the text."""
+═══ WHAT IS NOT AN ALIAS ═══
+
+DO NOT create ALIAS for:
+  • Role-to-role mappings:  Farm Worker||ALIAS||Farmer  ← roles are not entities
+  • Role-to-person:         Shepherd||ALIAS||Gabriel Oak ← role is not an entity
+  • Description-to-person:  the maltster||ALIAS||Warren  ← description, not entity
+  • Description-to-any:     young girl||ALIAS||Fanny Robin ← "young girl" is not a name
+  • Event-to-anything:      The Accident||ALIAS||The Fall on the Cobb ← events are not entities
+  • Possessive phrases:     anything with 's — Batheba's aunt||ALIAS||Mrs. Hurst
+  • Prepositional phrases:  names containing "at", "on", "of", "in", "by" etc. are usually events/descriptions
+  • Generic references:     the stranger||ALIAS||Francis Troy ← "the stranger" is not a name
+  • Pronoun:                she||ALIAS||Bathsheba Everdene ← pronouns are not names
+  • Same name twice:        Gabriel Oak||ALIAS||Gabriel Oak ← meaningless
+
+═══ ALIAS DIRECTION RULE ═══
+  ALWAYS: FULL_NAME||ALIAS||variant  (canonical → variant)
+  The subject holds the most complete name. If you only see "Boldwood" and "Mr. Boldwood" in the text,
+  decide on the canonical form and make it the subject:
+    William Boldwood||ALIAS||Boldwood
+    William Boldwood||ALIAS||Mr. Boldwood
+
+═══ HOW TO FIND ALIASES IN TEXT ═══
+
+Look for these patterns:
+  • "X, also called Y" / "X, otherwise known as Y"
+  • "X, or Y" where Y is clearly a name variant
+  • Surname used alone when full name was given earlier
+  • First name used alone when full name was given earlier
+  • Title + surname where full name is known
+  • Diminutive/nickname forms: Johnny for John, Lizzy for Elizabeth
+  • Character introduced with a descriptive phrase that resolves to their name:
+    "the maltster, Warren Malten" → Warren Malten||ALIAS||the maltster
+
+Extract ONLY ALIAS triples in this phase. Output 0 triples if no aliases are found — do not invent.
+Extract only facts EXPLICITLY stated or CLEARLY implied by name variation in the text."""
 
 
 # ============ 窗口总结系统提示词 ============
 
 # 同学可通过修改此提示词来调整窗口总结和三元组抽取的行为。
-# {rel_list} 会被替换为规范谓词列表，{triple_instruction} 会被替换为上述 TRIPLE_INSTRUCTION。
+# {triple_instruction} 会被替换为上述 TRIPLE_INSTRUCTION。
 SUMMARIZE_SYSTEM_PROMPT: str = """You are a literary analyst. For the given book section:
-1. Write a 2-3 sentence summary including key events, characters, and details.
-2. Extract 15-25 high-quality Knowledge Graph triples (subject||predicate||object).
-
-=== TRIPLE EXTRACTION RULES (follow strictly) ===
-
-PREDICATES (use ONLY these): {rel_list}
-
-═══ SUBJECT — only proper named entities ═══
-  RIGHT: Gabriel Oak, William Boldwood, Bathsheba Everdene, Weatherbury
-  WRONG: Boldwood (use full name), the maltster (find the name), a soldier (find the name)
-  WRONG: 'young girl', 'Liddy's sister', 'the stranger' — descriptions, NOT entities
-  Use the MOST COMPLETE name known: William Boldwood, not Boldwood.
-
-═══ OBJECT by predicate — what is valid ═══
-  HAS_ROLE: GENERIC role ONLY — Farmer, Shepherd, Servant, Soldier, Bailiff, Maid, Clerk.
-    WRONG: Gabriel Oak||HAS_ROLE||Baily Pennyways (person, not role)
-    WRONG: Cain Ball||HAS_ROLE||Gabriel Oak (person, not role)
-  HAS_ATTRIBUTE: a TRAIT (1-4 words) — brave, wealthy, tall, '28 years old', headstrong.
-    WRONG: X||HAS_ATTRIBUTE||Church of England (that's a religion/organization)
-    WRONG: X||HAS_ATTRIBUTE||Eleventh Dragoon-Guards Soldier (that's a role)
-    WRONG: 'clever man in talents', 'observant of stars' (verbose descriptions)
-  OWNS: significant named possessions only (farm, house, horse, dog). Skip trivial items.
-    NEVER a person: Gabriel Oak||OWNS||Fanny Robin is WRONG.
-  KNOWS: established acquaintances. Do NOT create both A||KNOWS||B and B||KNOWS||A.
-  ALIAS: alternate name for a person/place. NOT for roles (Farm Worker is a role, not entity).
-  PARTICIPATES_IN: NAMED events only. NEVER a person or place name.
-    WRONG: Gabriel Oak||PARTICIPATES_IN||Bathsheba Everdene (person, not event)
-    RIGHT: Gabriel Oak||PARTICIPATES_IN||The Storm
-  HAS_ATTRIBUTE: a TRAIT in 1-4 words. WRONG: 'imposing height and breadth', 'clever man in talents'.
+1. Write a concise summary covering key events, character introductions, and name variations used for each character. Pay special attention to how characters are referred to — full names, titles, nicknames, surname-only references — as this will help with alias extraction.
+2. Extract ALIAS triples ONLY, following the rules below exactly.
 
 Output format:
 [SUMMARY]
-<your 2-3 sentence summary>
+<your summary>
 [/SUMMARY]
 [TRIPLES]
 subject||predicate||object

@@ -4,13 +4,12 @@
 流程:
   1. 滑动窗口切分文本 (sentence-aware)
   2. 并行总结所有窗口 (ThreadPoolExecutor, 按 index 排序拼合)
-  3. 后处理三元组: 关系统一 → 实体对齐(LLM) → 去重(合并evidence)
+  3. 后处理三元组: 实体对齐(LLM) → 质量过滤 → 去重(合并evidence)
   4. 汇总所有总结, 基于总结回答问题 / 自动生成 QA 对
 
 外部依赖文件（同学主要修改这些）:
-  config.py    — API/模型/窗口/并发参数
-  constants.py — 规范谓词、归一化映射等常量
-  prompts.py   — 所有提示词 & 功能开关（含 ENABLE_QUESTION_INPUT / ENABLE_TRIPLE_INPUT）
+  config.py  — API/模型/窗口/并发参数
+  prompts.py — 所有提示词 & 功能开关（含 ENABLE_QUESTION_INPUT / ENABLE_TRIPLE_INPUT）
 """
 
 import os, re, time, json, threading, csv
@@ -21,9 +20,6 @@ from config import (
     API_BASE, API_KEY, MODEL, DATA_DIR,
     WINDOW_SIZE, OVERLAP, STRIDE,
     WORKERS, MAX_TOKENS_SUMMARIZE, MAX_TOKENS_ANSWER, MAX_RETRIES,
-)
-from constants import (
-    CANONICAL_PREDICATES, PREDICATE_NORMALIZATION, EVENT_DESC_WORDS,
 )
 from prompts import (
     ENABLE_QUESTION_INPUT,
@@ -112,11 +108,8 @@ def summarize_one(window_text: str, book_name: str,
                   idx: int, total: int) -> tuple[str, list[tuple[str, str, str]]]:
     """总结单个窗口并同步提取三元组（线程安全，可被并行调用）
     返回 (summary, [(subject, predicate, object), ...])"""
-    rel_list = ', '.join(sorted(CANONICAL_PREDICATES))
-    triple_instruction = TRIPLE_INSTRUCTION.format(canonical_predicates=rel_list)
     system_prompt = SUMMARIZE_SYSTEM_PROMPT.format(
-        rel_list=rel_list,
-        triple_instruction=triple_instruction,
+        triple_instruction=TRIPLE_INSTRUCTION,
     )
     msgs = [
         {"role": "system", "content": system_prompt},
@@ -231,31 +224,6 @@ def get_book_content(name: str) -> str:
 
 
 # ============ 三元组后处理 ============
-
-def _normalize_predicates(triples: list[dict]) -> list[dict]:
-    """将自由文本谓词映射到规范谓词集合，过滤无法映射的"""
-    normalized = []
-    dropped = 0
-    for t in triples:
-        pred = t["predicate"].strip()
-        if pred in CANONICAL_PREDICATES:
-            t["predicate"] = pred
-            normalized.append(t)
-            continue
-        mapped = PREDICATE_NORMALIZATION.get(pred)
-        if not mapped:
-            upper = pred.upper()
-            if upper in CANONICAL_PREDICATES:
-                mapped = upper
-        if mapped:
-            t["predicate"] = mapped
-            normalized.append(t)
-        else:
-            dropped += 1
-    if dropped:
-        print(f"  [Predicate Norm] Dropped {dropped} triples with unrecognized predicates.")
-    return normalized
-
 
 def _canonicalize_entities(triples: list[dict]) -> tuple[list[dict], dict[str, str]]:
     """使用 LLM 识别实体别名，将所有变体映射到规范实体名。
@@ -378,16 +346,16 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
             role_objects.add(t["object"])
 
     def _is_bad_alias(obj: str, subj: str) -> bool:
-        if "'s" in obj or "'s" in obj:
+        if "'" in obj:
             return True
         if len(obj.split()) > 5:
             return True
         if f"of {subj}" in obj.lower():
             return True
         obj_lower = obj.lower()
-        for w in EVENT_DESC_WORDS:
-            if w in obj_lower:
-                return True
+        # preposition phrases → descriptive event/location, not a name
+        if re.search(r'\b(at|on|in|near|by|from|for|with|of|to|over|under)\b', obj_lower):
+            return True
         first_word = obj.split()[0].lower() if obj.split() else ""
         if first_word.endswith("ing") and first_word not in ("nothing", "something", "everything"):
             return True
@@ -476,13 +444,12 @@ def _quality_filter(triples: list[dict]) -> list[dict]:
 
 
 def _post_process_triples(triples: list[dict]) -> list[dict]:
-    """三元组后处理管线：谓词统一 → 实体对齐 → 质量过滤 → 去重"""
+    """三元组后处理管线：实体对齐 → 质量过滤 → 去重"""
     if not triples:
         return triples
 
     print(f"\n  Post-processing {len(triples)} raw triples...")
 
-    triples = _normalize_predicates(triples)
     triples, _ = _canonicalize_entities(triples)
     triples = _quality_filter(triples)
     triples = _deduplicate_triples(triples)
