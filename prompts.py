@@ -33,61 +33,81 @@ Bathsheba Everdene||LOVES||Gabriel Oak"""
 # ============ 三元组提取指令 ============
 
 # 窗口级三元组提取详细规范，嵌入到 SUMMARIZE_SYSTEM_PROMPT 末尾使用。
-TRIPLE_INSTRUCTION: str = """THIS PHASE: extract ONLY ALIAS triples. Focus exclusively on entity name variations.
+TRIPLE_INSTRUCTION: str = """THIS PHASE: extract ONLY ALIAS triples — genuine NAME variations of the SAME entity.
 
 FORMAT: subject||ALIAS||object
-  subject = the entity's FULL/CANONICAL name (longest, most complete form)
-  object  = an alternate name, nickname, shortened form, or title+surname variant
+  subject = the most complete/canonical name form
+  object  = a genuine alternate name, nickname, or pseudonym
 
-═══ DIRECTION RULE ═══
-  ALWAYS: FULL_NAME||ALIAS||shorter_variant
-  Compare both sides — whichever is the LONGER, more complete form MUST be the subject.
-  CORRECT: John Watson||ALIAS||Dr. Watson
-  WRONG:   Dr. Watson||ALIAS||John Watson   (reversed — John Watson is the fuller name)
+═══ THE ONE TEST THAT MATTERS ═══
+
+Before outputting ANY triple, apply the CHARACTER ROSTER TEST:
+
+  Imagine you are writing a character list:
+    Character: Alexander Holder
+    Also Known As: ???
+
+  The object MUST be something that belongs in "Also Known As".
+  Ask yourself: "If someone read 'Who is <object>?', could I answer with just the character's name?"
+
+    "Who is Jem?" → "James Ryder"                         ✓ PASS → ALIAS
+    "Who is Vincent Spaulding?" → "John Clay"              ✓ PASS → ALIAS (pseudonym)
+    "Who is Mr. Boldwood?" → "William Boldwood"            ✓ PASS → ALIAS (title+surname)
+    "Who is the banker?" → ??? "Alexander Holder, but..."  ✗ FAIL — it's a job, not a name
+    "Who is her stepfather?" → ???                         ✗ FAIL — it's a relation, not a name
+    "Who is your Highness?" → ???                          ✗ FAIL — it's an honorific, not a name
+    "Who is the old man?" → ???                            ✗ FAIL — it's a description, not a name
+    "Who is a lawyer?" → ???                               ✗ FAIL — indefinite, not a specific name
+
+  This test alone eliminates most noise. Use it on EVERY candidate.
 
 ═══ VALID ALIAS PATTERNS ═══
 
-Create ALIAS only when BOTH subject and object are genuine NAME FORMS of the same entity:
+  nickname:          James Ryder||ALIAS||Jem
+  surname-only:      William Boldwood||ALIAS||Boldwood
+  first-name-only:   Gabriel Oak||ALIAS||Gabriel
+  title+surname:     William Boldwood||ALIAS||Mr. Boldwood
+  pseudonym:         John Clay||ALIAS||Vincent Spaulding
+  initial-based:     Henry Baker||ALIAS||H. B.
+  name-shortening:   Francis Hay Moulton||ALIAS||Francis H. Moulton
+  place-variant:     Weatherbury||ALIAS||Little Weatherbury
 
-  • Formal-name||ALIAS||nickname            (Robert||ALIAS||Bob, Elizabeth||ALIAS||Lizzy)
-  • Full-name||ALIAS||surname-only          (William Boldwood||ALIAS||Boldwood)
-  • Full-name||ALIAS||first-name-only       (Gabriel Oak||ALIAS||Gabriel)
-  • Full-name||ALIAS||title+surname         (William Boldwood||ALIAS||Mr. Boldwood)
-  • Full-title+name||ALIAS||surname-only    (Inspector Bradstreet||ALIAS||Bradstreet)
-  • Full-title+name||ALIAS||bare-name       (Miss Hunter||ALIAS||Violet Hunter)
-  • Real-name||ALIAS||pseudonym             (real identity ← fake name used in text)
-  • Full-name||ALIAS||abbreviation          (Ku Klux Klan||ALIAS||K. K. K.)
-  • Place-full-name||ALIAS||place-variant   (Weatherbury||ALIAS||Little Weatherbury)
+═══ CATEGORIES TO IGNORE ENTIRELY ═══
 
-═══ STRICTLY FORBIDDEN — these are NOT aliases ═══
+These are NOT aliases. Do not extract them under any predicate:
 
-1. BARE TITLES / HONORIFICS as object — these are roles, not names:
-   X||ALIAS||Doctor / Mademoiselle / Sir / Madam / your Highness / Your Majesty / my lord / Herr / Monsieur
+  INDEFINITE DESCRIPTIONS (use "a/an"):
+    a lawyer, a soldier, a tall man, a young girl, a stranger
+    → No specific referent. Discard.
 
-2. OCCUPATIONAL DESCRIPTIONS as object — job descriptions, not names:
-   X||ALIAS||the butler / the maid / the coachman / the constable / the commissionaire / the shepherd / the baker / the carpenter / the nurse / the lawyer / the priest
+  FAMILIAL REFERENCES (possessive):
+    her stepfather, his wife, my uncle, X's daughter
+    → Relations, not names. Discard.
 
-3. Roles as subject — roles/jobs are not entities:
-   Farm Worker||ALIAS||Farmer  /  Shepherd||ALIAS||PersonName  /  the servant||ALIAS||X
+  HONORIFICS / FORMAL ADDRESS:
+    your Highness, Your Majesty, Sir, Madame, my lord
+    → Forms of address, not names. Discard.
 
-4. Descriptive phrases as subject — descriptions are not names:
-   the stranger||ALIAS||X  /  young girl||ALIAS||X  /  a tall man||ALIAS||X  /  the old woman||ALIAS||X
+  OCCUPATIONAL LABELS (bare or with "the"):
+    the banker, the colonel, the doctor, the commissionaire, the butler
+    → Job titles used as shorthand, not names. Discard.
 
-5. Events as subject or object — events are not entities:
-   The Accident||ALIAS||X  /  X||ALIAS||The Storm  /  anything containing " at " " on " " of the " " in the "
+  NARRATIVE CIRCUMLOCUTIONS:
+    the old man, the unfortunate bridegroom, my dear girl, the man himself
+    → Temporary narrative references. Discard.
 
-6. Possessive / pronoun / self-loop:
-   X||ALIAS||X  (same name)  /  she||ALIAS||X  /  anything with 's  /  his X||ALIAS||Y
+  PRONOUNS: she, he, they, I, you → Discard.
+  SELF-LOOPS: X||ALIAS||X → Discard.
+  POSSESSIVE FORMS: anything with 's → Discard.
+  OBJECT-AS-SUBJECT: her stepfather||ALIAS||my stepfather → Discard.
 
-═══ DECISION FLOW ═══
-For each candidate pair, ask:
-  (a) Are BOTH sides genuine NAME FORMS of a person or place?
-  (b) Is the LONGER name on the LEFT (subject)?
-  (c) Is the object NOT a bare title, job description, event, or pronoun?
-  If any answer is NO → skip it.
+═══ DIRECTION ═══
+  Longer/more-complete name on the LEFT (subject).
+  John Watson||ALIAS||Dr. Watson ✓
+  Dr. Watson||ALIAS||John Watson ✗
 
-Extract ONLY ALIAS triples in this phase. Output 0 triples if no aliases are found — do not invent.
-Prefer UNDER-extraction over OVER-extraction. If unsure, skip it."""
+Extract ONLY ALIAS triples. If nothing passes the roster test, output 0 triples.
+When in doubt, DISCARD."""
 
 
 # ============ 窗口总结系统提示词 ============
