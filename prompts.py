@@ -36,58 +36,58 @@ Bathsheba Everdene||LOVES||Gabriel Oak"""
 TRIPLE_INSTRUCTION: str = """THIS PHASE: extract ONLY ALIAS triples. Focus exclusively on entity name variations.
 
 FORMAT: subject||ALIAS||object
-  subject = the entity's FULL/CANONICAL name
-  object  = an alternate name, nickname, shortened form, or title-based reference
+  subject = the entity's FULL/CANONICAL name (longest, most complete form)
+  object  = an alternate name, nickname, shortened form, or title+surname variant
 
-═══ WHAT MAKES A QUALITY ALIAS ═══
+═══ DIRECTION RULE ═══
+  ALWAYS: FULL_NAME||ALIAS||shorter_variant
+  Compare both sides — whichever is the LONGER, more complete form MUST be the subject.
+  CORRECT: John Watson||ALIAS||Dr. Watson
+  WRONG:   Dr. Watson||ALIAS||John Watson   (reversed — John Watson is the fuller name)
 
-A valid ALIAS triple captures that the same person/place is referred to by different names in the text. The subject MUST be the most complete/formal name you can find; the object is the variant.
+═══ VALID ALIAS PATTERNS ═══
 
-GOOD examples:
-  William Boldwood||ALIAS||Mr. Boldwood       (title + surname → full name)
-  William Boldwood||ALIAS||Boldwood             (surname-only reference)
-  Gabriel Oak||ALIAS||Gabriel                    (first-name-only reference)
-  Gabriel Oak||ALIAS||Farmer Oak               (role + surname variant)
-  Bathsheba Everdene||ALIAS||Bathsheba          (first-name-only reference)
-  Bathsheba Everdene||ALIAS||Miss Everdene      (title + surname)
-  Cain Ball||ALIAS||Cainy Ball                  (nickname)
-  Weatherbury||ALIAS||Little Weatherbury        (place name variant)
+Create ALIAS only when BOTH subject and object are genuine NAME FORMS of the same entity:
 
-═══ WHAT IS NOT AN ALIAS ═══
+  • Formal-name||ALIAS||nickname            (Robert||ALIAS||Bob, Elizabeth||ALIAS||Lizzy)
+  • Full-name||ALIAS||surname-only          (William Boldwood||ALIAS||Boldwood)
+  • Full-name||ALIAS||first-name-only       (Gabriel Oak||ALIAS||Gabriel)
+  • Full-name||ALIAS||title+surname         (William Boldwood||ALIAS||Mr. Boldwood)
+  • Full-title+name||ALIAS||surname-only    (Inspector Bradstreet||ALIAS||Bradstreet)
+  • Full-title+name||ALIAS||bare-name       (Miss Hunter||ALIAS||Violet Hunter)
+  • Real-name||ALIAS||pseudonym             (real identity ← fake name used in text)
+  • Full-name||ALIAS||abbreviation          (Ku Klux Klan||ALIAS||K. K. K.)
+  • Place-full-name||ALIAS||place-variant   (Weatherbury||ALIAS||Little Weatherbury)
 
-DO NOT create ALIAS for:
-  • Role-to-role mappings:  Farm Worker||ALIAS||Farmer  ← roles are not entities
-  • Role-to-person:         Shepherd||ALIAS||Gabriel Oak ← role is not an entity
-  • Description-to-person:  the maltster||ALIAS||Warren  ← description, not entity
-  • Description-to-any:     young girl||ALIAS||Fanny Robin ← "young girl" is not a name
-  • Event-to-anything:      The Accident||ALIAS||The Fall on the Cobb ← events are not entities
-  • Possessive phrases:     anything with 's — Batheba's aunt||ALIAS||Mrs. Hurst
-  • Prepositional phrases:  names containing "at", "on", "of", "in", "by" etc. are usually events/descriptions
-  • Generic references:     the stranger||ALIAS||Francis Troy ← "the stranger" is not a name
-  • Pronoun:                she||ALIAS||Bathsheba Everdene ← pronouns are not names
-  • Same name twice:        Gabriel Oak||ALIAS||Gabriel Oak ← meaningless
+═══ STRICTLY FORBIDDEN — these are NOT aliases ═══
 
-═══ ALIAS DIRECTION RULE ═══
-  ALWAYS: FULL_NAME||ALIAS||variant  (canonical → variant)
-  The subject holds the most complete name. If you only see "Boldwood" and "Mr. Boldwood" in the text,
-  decide on the canonical form and make it the subject:
-    William Boldwood||ALIAS||Boldwood
-    William Boldwood||ALIAS||Mr. Boldwood
+1. BARE TITLES / HONORIFICS as object — these are roles, not names:
+   X||ALIAS||Doctor / Mademoiselle / Sir / Madam / your Highness / Your Majesty / my lord / Herr / Monsieur
 
-═══ HOW TO FIND ALIASES IN TEXT ═══
+2. OCCUPATIONAL DESCRIPTIONS as object — job descriptions, not names:
+   X||ALIAS||the butler / the maid / the coachman / the constable / the commissionaire / the shepherd / the baker / the carpenter / the nurse / the lawyer / the priest
 
-Look for these patterns:
-  • "X, also called Y" / "X, otherwise known as Y"
-  • "X, or Y" where Y is clearly a name variant
-  • Surname used alone when full name was given earlier
-  • First name used alone when full name was given earlier
-  • Title + surname where full name is known
-  • Diminutive/nickname forms: Johnny for John, Lizzy for Elizabeth
-  • Character introduced with a descriptive phrase that resolves to their name:
-    "the maltster, Warren Malten" → Warren Malten||ALIAS||the maltster
+3. Roles as subject — roles/jobs are not entities:
+   Farm Worker||ALIAS||Farmer  /  Shepherd||ALIAS||PersonName  /  the servant||ALIAS||X
+
+4. Descriptive phrases as subject — descriptions are not names:
+   the stranger||ALIAS||X  /  young girl||ALIAS||X  /  a tall man||ALIAS||X  /  the old woman||ALIAS||X
+
+5. Events as subject or object — events are not entities:
+   The Accident||ALIAS||X  /  X||ALIAS||The Storm  /  anything containing " at " " on " " of the " " in the "
+
+6. Possessive / pronoun / self-loop:
+   X||ALIAS||X  (same name)  /  she||ALIAS||X  /  anything with 's  /  his X||ALIAS||Y
+
+═══ DECISION FLOW ═══
+For each candidate pair, ask:
+  (a) Are BOTH sides genuine NAME FORMS of a person or place?
+  (b) Is the LONGER name on the LEFT (subject)?
+  (c) Is the object NOT a bare title, job description, event, or pronoun?
+  If any answer is NO → skip it.
 
 Extract ONLY ALIAS triples in this phase. Output 0 triples if no aliases are found — do not invent.
-Extract only facts EXPLICITLY stated or CLEARLY implied by name variation in the text."""
+Prefer UNDER-extraction over OVER-extraction. If unsure, skip it."""
 
 
 # ============ 窗口总结系统提示词 ============
