@@ -1,15 +1,20 @@
 """
-长文本理解管线 — 滑动窗口 + 并行分段总结 + 汇总回答 + 三元组抽取
+长文本理解管线 — 对抗式三元组抽取 + 滑动窗口 + 汇总回答
 
 流程:
   1. 滑动窗口切分文本 (sentence-aware)
-  2. 并行总结所有窗口 (ThreadPoolExecutor, 按 index 排序拼合)
-  3. 后处理三元组: 实体对齐(LLM) → 质量过滤 → 去重(合并evidence)
-  4. 汇总所有总结, 基于总结回答问题 / 自动生成 QA 对
+  2. 对抗式窗口处理 (每个窗口 4 步):
+     Step 1: 总结者 —— 概括章节内容
+     Step 2: 抽取者 —— 读总结+原文，提取 ALIAS 三元组
+     Step 3: 校验者 —— 逐条检查三元组合理性
+     Step 4: 修正者 —— 根据反馈重新抽取（最多 MAX_ITERATIONS 轮）
+  3. 并行处理所有窗口 (ThreadPoolExecutor, 按 index 排序拼合)
+  4. 后处理三元组: 实体对齐(LLM) → 质量过滤 → 去重(合并evidence)
+  5. 汇总所有总结, 基于总结回答问题 / 自动生成 QA 对
 
 外部依赖文件（同学主要修改这些）:
-  config.py  — API/模型/窗口/并发参数
-  prompts.py — 所有提示词 & 功能开关（含 ENABLE_QUESTION_INPUT / ENABLE_TRIPLE_INPUT）
+  config.py  — API/模型/窗口/并发参数 & MAX_ITERATIONS
+  prompts.py — 4 个角色提示词 & 功能开关
 """
 
 import os, re, time, json, threading, csv
@@ -19,13 +24,16 @@ from openai import OpenAI
 from config import (
     API_BASE, API_KEY, MODEL, DATA_DIR,
     WINDOW_SIZE, OVERLAP, STRIDE,
-    WORKERS, MAX_TOKENS_SUMMARIZE, MAX_TOKENS_ANSWER, MAX_RETRIES,
+    WORKERS, MAX_TOKENS_SUMMARIZE, MAX_TOKENS_ANSWER, MAX_RETRIES, MAX_ITERATIONS,
 )
 from prompts import (
     ENABLE_QUESTION_INPUT,
     ENABLE_TRIPLE_INPUT,
     TRIPLE_INSTRUCTION,
-    SUMMARIZE_SYSTEM_PROMPT,
+    SUMMARIZE_CHUNK_PROMPT,
+    EXTRACT_TRIPLES_PROMPT,
+    VALIDATE_TRIPLES_PROMPT,
+    REVISE_TRIPLES_PROMPT,
     ENTITY_CANON_SYSTEM_PROMPT,
     ENTITY_CANON_USER_PROMPT,
     ANSWER_SYSTEM_PROMPT,
@@ -75,16 +83,9 @@ def _call_model(messages: list, max_tokens: int) -> str:
         raise RuntimeError(f"API call failed: {e}")
 
 
-def _parse_response(text: str) -> tuple[str, list[tuple[str, str, str]]]:
-    """从模型回复中解析 [SUMMARY]...[/SUMMARY] 和 [TRIPLES]...[/TRIPLES] 块
-    返回 (summary, [(subject, predicate, object), ...])"""
-    summary = ""
+def _parse_triples_block(text: str) -> list[tuple[str, str, str]]:
+    """从模型回复中解析 [TRIPLES]...[/TRIPLES] 块"""
     triples: list[tuple[str, str, str]] = []
-
-    sm = re.search(r'\[SUMMARY\]\s*(.*?)\s*\[/SUMMARY\]', text, re.DOTALL | re.IGNORECASE)
-    if sm:
-        summary = sm.group(1).strip()
-
     tm = re.search(r'\[TRIPLES\]\s*(.*?)\s*\[/TRIPLES\]', text, re.DOTALL | re.IGNORECASE)
     if tm:
         for line in tm.group(1).strip().split('\n'):
@@ -95,42 +96,111 @@ def _parse_response(text: str) -> tuple[str, list[tuple[str, str, str]]]:
             parts = [p.strip() for p in parts if p.strip()]
             if len(parts) >= 3:
                 triples.append((parts[0], parts[1], parts[2]))
-
-    if not summary:
-        summary = text.strip()
-
-    return summary, triples
+    return triples
 
 
-# ============ 窗口总结 ============
+def _format_triples_text(triples: list[tuple[str, str, str]]) -> str:
+    """将三元组列表格式化为 subject||predicate||object 文本"""
+    return "\n".join(f"{s}||{p}||{o}" for s, p, o in triples)
 
-def summarize_one(window_text: str, book_name: str,
-                  idx: int, total: int) -> tuple[str, list[tuple[str, str, str]]]:
-    """总结单个窗口并同步提取三元组（线程安全，可被并行调用）
-    返回 (summary, [(subject, predicate, object), ...])"""
-    system_prompt = SUMMARIZE_SYSTEM_PROMPT.format(
-        triple_instruction=TRIPLE_INSTRUCTION,
-    )
+
+def _parse_verdict(text: str) -> tuple[bool, str]:
+    """解析 [VERDICT] 和 [FEEDBACK] 块，返回 (passed, feedback)"""
+    passed = False
+    feedback = ""
+
+    vm = re.search(r'\[VERDICT\]\s*(.*?)\s*\[/VERDICT\]', text, re.DOTALL | re.IGNORECASE)
+    if vm:
+        verdict_text = vm.group(1).strip().upper()
+        passed = "PASS" in verdict_text and "FAIL" not in verdict_text
+
+    fm = re.search(r'\[FEEDBACK\]\s*(.*?)\s*\[/FEEDBACK\]', text, re.DOTALL | re.IGNORECASE)
+    if fm:
+        feedback = fm.group(1).strip()
+
+    return passed, feedback
+
+
+# ============ 对抗式窗口总结 ============
+
+def _summarize_chunk(window_text: str, book_name: str,
+                     idx: int, total: int) -> str:
+    """Step 1: 总结者 —— 只做章节概括，不抽取三元组"""
     msgs = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": SUMMARIZE_CHUNK_PROMPT},
         {"role": "user", "content": f"[{book_name} | {idx}/{total}]\n{window_text}"},
     ]
+    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
+    return r.strip() if r else "[summary unavailable]"
+
+
+def _extract_triples(summary: str, window_text: str) -> list[tuple[str, str, str]]:
+    """Step 2: 抽取者 —— 读 summary + 原文，从中提取 ALIAS 三元组"""
+    system_prompt = EXTRACT_TRIPLES_PROMPT.format(triple_instruction=TRIPLE_INSTRUCTION)
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Summary:\n{summary}\n\nOriginal Text:\n{window_text}"},
+    ]
+    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
+    return _parse_triples_block(r)
+
+
+def _validate_triples(triples: list[tuple[str, str, str]],
+                      window_text: str) -> tuple[bool, str]:
+    """Step 3: 校验者 —— 逐条检查三元组是否合理，返回 (passed, feedback)"""
+    triples_text = _format_triples_text(triples)
+    msgs = [
+        {"role": "system", "content": VALIDATE_TRIPLES_PROMPT},
+        {"role": "user", "content": f"Original Text:\n{window_text}\n\nTriples to validate:\n{triples_text}"},
+    ]
+    r = _call_model(msgs, max(512, MAX_TOKENS_SUMMARIZE // 2))
+    return _parse_verdict(r)
+
+
+def _revise_triples(summary: str, window_text: str,
+                    triples: list[tuple[str, str, str]],
+                    feedback: str) -> list[tuple[str, str, str]]:
+    """Step 4: 修正者 —— 根据校验反馈重新抽取三元组"""
+    triples_text = _format_triples_text(triples)
+    system_prompt = REVISE_TRIPLES_PROMPT.format(triple_instruction=TRIPLE_INSTRUCTION)
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Summary:\n{summary}\n\nOriginal Text:\n{window_text}\n\nYour previous triples:\n{triples_text}\n\nReviewer feedback:\n{feedback}"},
+    ]
+    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
+    revised = _parse_triples_block(r)
+    return revised if revised else triples
+
+
+def summarize_one_adversarial(window_text: str, book_name: str,
+                              idx: int, total: int) -> tuple[str, list[tuple[str, str, str]]]:
+    """对抗式多步总结：总结 → 抽取 → 校验 → 修正（最多 MAX_ITERATIONS 轮）
+    线程安全，返回 (summary, [(subject, predicate, object), ...])"""
     for attempt in range(MAX_RETRIES + 1):
         try:
-            r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
-            summary, triples = _parse_response(r)
+            # Step 1: 总结
+            summary = _summarize_chunk(window_text, book_name, idx, total)
+
+            # Step 2: 抽取
+            triples = _extract_triples(summary, window_text)
+
+            # Step 3-4: 校验→修正 循环
+            if triples:
+                for iteration in range(MAX_ITERATIONS):
+                    passed, feedback = _validate_triples(triples, window_text)
+                    if passed:
+                        break
+                    if iteration < MAX_ITERATIONS - 1:
+                        triples = _revise_triples(summary, window_text, triples, feedback)
+
             if summary:
                 return summary, triples
-            if attempt < MAX_RETRIES:
-                r = _call_model(msgs, MAX_TOKENS_SUMMARIZE * 2)
-                summary, triples = _parse_response(r)
-                if summary:
-                    return summary, triples
         except Exception as e:
             if attempt < MAX_RETRIES:
                 time.sleep(2 * (attempt + 1))
                 continue
-            print(f"  [Warn] summarize_one failed after {MAX_RETRIES + 1} attempts: {e}")
+            print(f"  [Warn] summarize_one_adversarial failed after {MAX_RETRIES + 1} attempts: {e}")
+
     return "[summary unavailable]", []
 
 
@@ -157,8 +227,8 @@ def summarize_all_parallel(tasks: list[dict], workers: int = WORKERS,
 
     def process(t: dict) -> tuple[int, str, list[tuple[str, str, str]]]:
         idx = t["global_idx"]
-        summary, triples = summarize_one(t["text"], t["book_name"],
-                                         t["section_idx"], t["section_total"])
+        summary, triples = summarize_one_adversarial(t["text"], t["book_name"],
+                                                       t["section_idx"], t["section_total"])
         with lock:
             done.add(idx)
             results[idx] = summary

@@ -2,18 +2,17 @@
 模型提示词常量 & 功能开关。
 
 ============================================================================
-同学看这里 —— 如何生成高质量 QA 对和三元组：
-  你只需要修改本文件中的提示词（TRIPLE_INSTRUCTION / SUMMARIZE_SYSTEM_PROMPT /
-  QA_GENERATION_PROMPT 等），不需要在交互界面输入任何问题示例或三元组示例，
-  管线就能自动输出 QA 对和三元组。
+同学看这里 —— 对抗式三元组抽取系统：
+  本文件包含 4 个角色提示词，组成「总结→抽取→校验→修正」对抗管线：
+    Step 1: SUMMARIZE_CHUNK_PROMPT — 总结者，只做章节概括
+    Step 2: EXTRACT_TRIPLES_PROMPT  — 抽取者，从原文中找 ALIAS 三元组
+    Step 3: VALIDATE_TRIPLES_PROMPT — 校验者，检查三元组是否合理
+    Step 4: REVISE_TRIPLES_PROMPT  — 修正者，根据反馈重新抽取
 
   使用方式：
-    1. 将 ENABLE_QUESTION_INPUT 设为 False → 不手输问题，靠 QA_GENERATION_PROMPT 自动生成
-    2. 将 ENABLE_TRIPLE_INPUT 设为 False → 不手输三元组，靠提示词引导模型抽取
-    3. 修改下方各 PROMPT 来优化生成质量
-
-  如果你需要借助三元组来引导问题生成，将 ENABLE_TRIPLE_INPUT 设为 True，
-  并在交互界面输入三元组作为引导即可。
+    1. 修改下方各 PROMPT 来优化各角色的表现
+    2. TRIPLE_INSTRUCTION 会被注入到 Step 2 和 Step 4 的提示词中
+    3. ENABLE_QUESTION_INPUT / ENABLE_TRIPLE_INPUT 控制交互界面行为
 ============================================================================
 """
 
@@ -30,9 +29,8 @@ ENABLE_TRIPLE_INPUT: bool = False
 DEFAULT_TRIPLE_EXAMPLE: str = """Gabriel Oak||HAS_ROLE||Shepherd
 Bathsheba Everdene||LOVES||Gabriel Oak"""
 
-# ============ 三元组提取指令 ============
+# ============ 三元组提取指令（被 Step 2 & Step 4 共用）============
 
-# 窗口级三元组提取详细规范，嵌入到 SUMMARIZE_SYSTEM_PROMPT 末尾使用。
 TRIPLE_INSTRUCTION: str = """THIS PHASE: extract ONLY ALIAS triples — genuine NAME variations of the SAME entity.
 
 FORMAT: subject||ALIAS||object
@@ -110,24 +108,120 @@ Extract ONLY ALIAS triples. If nothing passes the roster test, output 0 triples.
 When in doubt, DISCARD."""
 
 
-# ============ 窗口总结系统提示词 ============
+# ============ Step 1: 总结者提示词 ============
 
-# 同学可通过修改此提示词来调整窗口总结和三元组抽取的行为。
-# {triple_instruction} 会被替换为上述 TRIPLE_INSTRUCTION。
-SUMMARIZE_SYSTEM_PROMPT: str = """You are a literary analyst. For the given book section:
-1. Write a concise summary covering key events, character introductions, and name variations used for each character. Pay special attention to how characters are referred to — full names, titles, nicknames, surname-only references — as this will help with alias extraction.
-2. Extract ALIAS triples ONLY, following the rules below exactly.
+SUMMARIZE_CHUNK_PROMPT: str = """You are a literary analyst. For the given book section, write a concise summary covering:
+- Key events and plot developments
+- Character introductions, interactions, and relationships
+- How each character is referred to — full names, titles, nicknames, surname-only references, pseudonyms
+
+Pay special attention to name variations: if a character is called by different names in this section (e.g., "Mr. Boldwood" and "William Boldwood"), note this explicitly — it will be crucial for alias extraction later.
+
+Output ONLY the summary text. Do NOT extract triples or add any other sections."""
+
+
+# ============ Step 2: 抽取者提示词 ============
+
+# {triple_instruction} 会被替换为上方 TRIPLE_INSTRUCTION
+EXTRACT_TRIPLES_PROMPT: str = """You are a knowledge graph expert specializing in entity alias extraction from literary texts.
+
+You will receive:
+1. A summary of a book section (for context)
+2. The original text of that section (your extraction source)
+
+Your task: extract ALIAS triples from the ORIGINAL TEXT. Use the summary to understand who's who, but ONLY extract triples where BOTH the subject and object names ACTUALLY APPEAR in the original text.
+
+CRITICAL: You must find the name variations IN THE TEXT. Do not invent aliases. If the text calls a character "Mr. Boldwood" in one sentence and "William Boldwood" in another, and you can confirm they refer to the same person, then output:
+William Boldwood||ALIAS||Mr. Boldwood
+
+If you cannot confirm two names refer to the same person from the text, do NOT output a triple for them.
+
+{triple_instruction}
 
 Output format:
-[SUMMARY]
-<your summary>
-[/SUMMARY]
 [TRIPLES]
-subject||predicate||object
+subject||ALIAS||object
 [/TRIPLES]
 
-Triple extraction guide:
-{triple_instruction}"""
+If no valid ALIAS triples exist in this section, output an empty [TRIPLES] block."""
+
+
+# ============ Step 3: 校验者提示词 ============
+
+VALIDATE_TRIPLES_PROMPT: str = """You are a strict quality auditor for knowledge graph triples extracted from literary texts.
+
+You will receive:
+1. A set of ALIAS triples to validate (format: subject||ALIAS||object)
+2. The original book text they were extracted from
+
+For EVERY triple, apply these checks:
+
+1. CHARACTER ROSTER TEST (the most important check):
+   Ask: "If someone reads 'Who is <object>?', can I answer with '<subject>'?"
+   - "Who is Jem?" → "James Ryder" ✓ → this is an ALIAS
+   - "Who is the banker?" → "Alexander Holder, but that's his job, not his name" ✗ → NOT an alias
+   - "Who is a lawyer?" → "I don't know which specific person" ✗ → indefinite, NOT an alias
+   - "Who is her stepfather?" → "He is related to her, his name is..." ✗ → relation, NOT an alias
+
+2. SPECIFICITY CHECK — the object must be a DEFINITE reference to a specific person:
+   INVALID (indefinite): "a lawyer", "a soldier", "a stranger", "a young girl"
+   INVALID (relation): "her stepfather", "his wife", "my uncle", "X's daughter"
+   INVALID (job title): "the banker", "the colonel", "the doctor", "the butler"
+   INVALID (honorific): "your Highness", "Sir", "Madame", "my lord"
+   INVALID (description): "the old man", "the tall woman", "the unfortunate bridegroom"
+
+3. DIRECTION CHECK — the more complete/canonical name must be the subject (left side):
+   "John Watson||ALIAS||Dr. Watson" ✓
+   "Dr. Watson||ALIAS||John Watson" ✗
+   "William Boldwood||ALIAS||Mr. Boldwood" ✓
+
+4. TEXT SUPPORT CHECK — does the original text actually show or imply these two names refer to the same person?
+   If the text never connects the two names, flag it as unsupported.
+
+Output format:
+
+If ALL triples pass ALL checks:
+[VERDICT]
+PASS
+[/VERDICT]
+
+If ANY triple fails ANY check:
+[VERDICT]
+FAIL
+[/VERDICT]
+[FEEDBACK]
+- "X||ALIAS||Y": FAILS <check name>. <brief explanation of why it fails and how to fix>
+- "A||ALIAS||B": FAILS <check name>. <brief explanation>
+[/FEEDBACK]
+
+Be strict. When in doubt, FAIL the triple and explain why."""
+
+
+# ============ Step 4: 修正者提示词 ============
+
+# {triple_instruction} 会被替换为上方 TRIPLE_INSTRUCTION
+REVISE_TRIPLES_PROMPT: str = """You are a knowledge graph expert. Your previous ALIAS triple extraction was reviewed and issues were found.
+
+You will receive:
+1. The book section summary
+2. The original text
+3. Your previous triples
+4. Reviewer feedback (specific triples that failed and why)
+
+Your task: re-extract ALIAS triples from the original text, addressing ALL issues raised in the feedback:
+- REMOVE any triple the reviewer flagged as invalid
+- FIX direction errors (more complete name on the LEFT as subject)
+- Only output triples where both names appear in the text and clearly refer to the same person
+- Apply the Character Roster Test to every triple before outputting
+
+{triple_instruction}
+
+Output format:
+[TRIPLES]
+subject||ALIAS||object
+[/TRIPLES]
+
+If after fixing all issues there are no valid triples, output an empty [TRIPLES] block."""
 
 
 # ============ 实体对齐提示词 ============
@@ -185,14 +279,11 @@ canonical_name
 
 # ============ 最终回答 / QA 生成提示词 ============
 
-# 同学可直接修改此提示词来优化最终回答的质量。
 ANSWER_SYSTEM_PROMPT: str = (
     "You are given section summaries of one or more books. "
     "Answer based on ALL summaries. Cite sections as evidence."
 )
 
-# 当 ENABLE_QUESTION_INPUT=False 时，使用此提示词从总结中自动生成 QA 对。
-# 同学可修改此提示词来控制自动生成的问题风格、数量和难度。
 QA_GENERATION_PROMPT: str = """You are given section summaries of one or more books.
 Based on the summaries, generate 3-5 high-quality question-answer pairs about the book content.
 Each QA pair should test deep understanding of characters, relationships, events, and plot.
