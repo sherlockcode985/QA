@@ -291,10 +291,17 @@ ANSWER_SYSTEM_PROMPT: str = (
     "CRITICAL — For EACH factual claim you make, cite its source section(s) in brackets, "
     "like [Section 3] or [Sections 3-5]. "
     "Every distinct fact (character introduction, event, relationship, plot point) must be "
-    "attributed to a specific section. This enables automated evidence verification.\n\n"
+    "attributed to a specific section.\n\n"
     "If a claim spans multiple sections, list all of them: [Sections 3, 7, 12].\n"
     "If the question has multiple sub-parts, organize your answer with clear "
-    "paragraphs or bullet points, each with its own citations."
+    "paragraphs or bullet points, each with its own citations.\n\n"
+    "Output format — a JSON object:\n"
+    '{\n'
+    '    "book": "<book filename>",\n'
+    '    "question": "<the question>",\n'
+    '    "answer": "<your answer with [Section N] citations>"\n'
+    "}\n\n"
+    "Return ONLY the JSON object, no other text."
 )
 
 QA_GENERATION_PROMPT: str = """You are given section summaries of one or more books.
@@ -308,51 +315,48 @@ Requirements:
   [Section 3] or [Sections 5-7]. Every distinct fact must have a citation.
 - Avoid yes/no questions; prefer open-ended questions requiring reasoning.
 
-Output format:
-[QA_PAIRS]
-Q1: <question>
-A1: <answer with [Section N] citations>
+Output format — a JSON array of objects:
+[
+    {
+        "book": "<book filename>",
+        "question": "<question>",
+        "answer": "<answer with [Section N] citations>"
+    },
+    ...
+]
 
-Q2: <question>
-A2: <answer with [Section N] citations>
-[/QA_PAIRS]"""
+Return ONLY the JSON array, no other text."""
 
 
 # ============ 原文证据验证提示词 ============
 
-EVIDENCE_VERIFICATION_PROMPT: str = """You are a literary evidence verification expert. Your task is to find VERBATIM supporting evidence from original text sections for each factual claim in an answer.
+EVIDENCE_VERIFICATION_PROMPT: str = """You are a literary evidence verification expert. Your task is to find VERBATIM supporting evidence from the original text for each QA pair.
 
 You will receive:
-1. A QUESTION (or "N/A" for auto-generated QA)
-2. An ANSWER containing claims with [Section N] citations
-3. The ORIGINAL TEXT of the cited sections
+1. A CITED SECTIONS block containing the original text of all cited sections
+2. A QA ARRAY — JSON array of {book, question, answer} objects
 
-For EACH factual claim in the answer:
-1. Locate it in the answer text
-2. Read the corresponding original text section(s)
-3. Find a VERBATIM (exact, word-for-word) quote from the original text that directly supports the claim
-4. Output the evidence in the specified format
+For EACH QA pair's answer:
+1. Read the factual claims and their [Section N] citations
+2. Find VERBATIM (exact, word-for-word) quotes from the corresponding original text sections that support each claim
+3. Add the evidence to that QA object
 
 RULES:
 - Evidence MUST be exact quotes from the original text — no paraphrasing, no rewording
 - If a claim has support but no single sentence captures it, use the most relevant 1-3 consecutive sentences
-- If a claim CANNOT be supported by any text in the cited sections, mark it as [UNSUPPORTED]
-- Be honest — do not fabricate or stretch evidence. "Not found" is a valid answer.
-- Only use the sections actually cited for each claim. Do not use other sections to fill gaps.
+- If a claim CANNOT be supported, do NOT include evidence for it
+- Be honest — do not fabricate or stretch evidence.
 
-For auto-generated QA pairs (answer contains Q1/Q2/Q3...), identify which Q number each claim belongs to and include it in the output.
+Output format — a JSON array of objects, same as input but with an "evidence" field added:
+[
+    {
+        "book": "...",
+        "question": "...",
+        "answer": "...",
+        "evidence": ["verbatim quote 1", "verbatim quote 2"]
+    },
+    ...
+]
 
-Output format — ONE [EVIDENCE] block per claim:
-
-[EVIDENCE]
-Q: <Q number, or "N/A" for single-question answer>
-Claim: <restate the specific claim>
-Section(s): <N>
-Verbatim Evidence: "<exact quote from the original text>"
-[/EVIDENCE]
-
-If the answer makes many claims, produce evidence for each. If NO claim can be supported:
-
-[NO_EVIDENCE_FOUND]
-Explanation: <brief reason>
-[/NO_EVIDENCE_FOUND]"""
+If no evidence can be found for any QA pair, return the input array unchanged (without evidence field).
+Return ONLY the JSON array, no other text."""

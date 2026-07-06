@@ -546,107 +546,86 @@ def _post_process_triples(triples: list[dict]) -> list[dict]:
 
 
 def _parse_qa_pairs(answer: str) -> list[tuple[int, str, str]]:
-    """从自动生成的 QA 文本中解析出单个 Q/A 对。
-    返回 [(q_number, question_text, answer_text), ...]"""
-    m = re.search(r'\[QA_PAIRS\]\s*(.*?)\s*\[/QA_PAIRS\]', answer, re.DOTALL | re.IGNORECASE)
-    if not m:
+    """从 JSON 格式的 QA 数组中解析单个 Q/A 对。
+    返回 [(index, question_text, answer_text), ...]"""
+    try:
+        data = json.loads(answer)
+        if not isinstance(data, list):
+            data = [data]
+        return [(i + 1, item.get("question", ""), item.get("answer", "")) for i, item in enumerate(data)]
+    except (json.JSONDecodeError, TypeError):
         return []
-    content = m.group(1)
-    pairs = []
-    for qm in re.finditer(r'Q(\d+):\s*(.*?)\s*A\1:\s*(.*?)(?=Q\d+:|$)', content, re.DOTALL):
-        pairs.append((int(qm.group(1)), qm.group(2).strip(), qm.group(3).strip()))
-    return pairs
-
-
-_SECTION_RE = re.compile(
-    r'\s*\[Section(?:s)?\s*(\d+(?:\s*[-–—,]\s*\d+)*(?:\s*,\s*\d+)*)\]',
-    re.IGNORECASE
-)
 
 
 def _strip_section_refs(text: str) -> str:
     """去掉答案中的 [Section N] 引用标记，仅用于显示。"""
-    return _SECTION_RE.sub('', text).strip()
+    return re.sub(r'\s*\[Section(?:s)?\s*(\d+(?:\s*[-–—,]\s*\d+)*(?:\s*,\s*\d+)*)\]', '', text).strip()
 
 
-def _group_evidence_by_q(evidence_text: str) -> dict[int, list[str]]:
-    """将证据文本按 Q 编号分组。
-    返回 {q_number: [verbatim_quote, ...]}
-    如果证据块没有 Q 编号，按出现顺序分配。"""
+def _group_evidence_by_q(qa_array_str: str) -> dict[int, list[str]]:
+    """从 JSON 格式的 QA 数组中提取 evidence 字段，按顺序分组。
+    返回 {index: [verbatim_quote, ...]}"""
     by_q: dict[int, list[str]] = {}
-    # 按出现顺序收集所有证据块
-    unassigned: list[str] = []
-
-    for em in re.finditer(r'\[EVIDENCE\]\s*(.*?)\s*\[/EVIDENCE\]', evidence_text, re.DOTALL | re.IGNORECASE):
-        block = em.group(1)
-
-        # 提取 Q 编号
-        qm = re.search(r'Q:\s*(\d+)', block)
-        qnum = int(qm.group(1)) if qm else None
-
-        # 提取 Verbatim Evidence：从 "Verbatim Evidence:" 后的第一个 " 到最后一个 "
-        quote = None
-        vi = block.find('Verbatim Evidence:')
-        if vi >= 0:
-            qs = block.find('"', vi)
-            if qs >= 0:
-                qe = block.rfind('"', qs + 1)
-                if qe > qs:
-                    quote = block[qs + 1:qe].strip()
-
-        if quote:
-            if qnum is not None:
-                by_q.setdefault(qnum, []).append(quote)
-            else:
-                unassigned.append(quote)
-
-    # 如果没有 Q 编号的证据，按出现顺序分配给 1, 2, 3...
-    if unassigned:
-        max_q = max(by_q.keys()) if by_q else 0
-        for i, q in enumerate(unassigned, 1):
-            by_q.setdefault(max_q + i, []).append(q)
-
+    try:
+        data = json.loads(qa_array_str)
+        if not isinstance(data, list):
+            data = [data]
+        for i, item in enumerate(data):
+            ev = item.get("evidence", [])
+            if isinstance(ev, str):
+                ev = [ev]
+            if ev:
+                by_q[i + 1] = ev
+    except (json.JSONDecodeError, TypeError):
+        pass
     return by_q
 
 
 def _is_auto_qa_answer(answer: str) -> bool:
-    """判断回答是否为自动生成的 QA pairs"""
-    return bool(re.search(r'\[QA_PAIRS\]', answer, re.IGNORECASE))
+    """判断回答是否为 JSON 数组格式的 QA pairs"""
+    try:
+        data = json.loads(answer)
+        return isinstance(data, list)
+    except (json.JSONDecodeError, TypeError):
+        return False
 
 
 def _verify_evidence(answer: str, chunk_registry: dict,
                       question: str | None = None,
                       max_sections: int = 30) -> tuple[str, dict[int, list[str]]]:
-    """从原文中为答案中的每个事实性陈述提取逐字证据。
+    """从原文中为 JSON 格式的 QA 数组提取逐字证据。
 
-    answer 中应包含 [Section N] 引用，函数会：
-    1. 解析出所有被引用的 section
-    2. 从 chunk_registry 中取出对应的原文
-    3. 调用 LLM 提取逐字证据
-
-    返回 (evidence_full_text, per_q_evidence)
-    per_q_evidence: {q_number: [verbatim_quote, ...]}，非 QA 模式时为 {}
+    answer 应为 JSON 数组/对象，answer/response 字段含 [Section N] 引用。
+    返回 (json_string_with_evidence, per_q_evidence)
     """
-    is_qa = _is_auto_qa_answer(answer)
+    # 1. 解析 JSON，收集所有 [Section N] 引用
+    try:
+        qa_list = json.loads(answer)
+        if not isinstance(qa_list, list):
+            qa_list = [qa_list]
+    except json.JSONDecodeError:
+        return answer, {}
 
-    # 1. 解析答案中引用的所有 section 编号
+    # 从 answer 字段或 response 字段中提取 section 引用
+    def _get_ans(item: dict) -> str:
+        return item.get("answer") or item.get("response") or ""
+
     cited: set[int] = set()
-    # Pattern 1: [Section N] or [Sections N-M] (range via hyphen/dash)
-    for m in re.finditer(r'\[Section(?:s)?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]', answer, re.IGNORECASE):
-        start = int(m.group(1))
-        end = int(m.group(2)) if m.group(2) else start
-        for s in range(start, end + 1):
-            cited.add(s)
-    # Pattern 2: [Sections N, M, ...] (comma-separated list)
-    for m in re.finditer(r'\[Section(?:s)?\s+(\d+(?:\s*,\s*\d+)+)\]', answer, re.IGNORECASE):
-        for token in re.split(r'\s*,\s*', m.group(1)):
-            s = int(token.strip())
-            if 1 <= s <= len(chunk_registry) * 2:
+    for qa in qa_list:
+        a_text = _get_ans(qa)
+        for m in re.finditer(r'\[Section(?:s)?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]', a_text, re.IGNORECASE):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else start
+            for s in range(start, end + 1):
                 cited.add(s)
+        for m in re.finditer(r'\[Section(?:s)?\s+(\d+(?:\s*,\s*\d+)+)\]', a_text, re.IGNORECASE):
+            for token in re.split(r'\s*,\s*', m.group(1)):
+                s = int(token.strip())
+                if 1 <= s <= len(chunk_registry) * 2:
+                    cited.add(s)
 
     if not cited:
-        msg = "\n\n[EVIDENCE]\n(答案中未发现 [Section N] 引用，无法验证原文证据。)\n[/EVIDENCE]"
-        return msg, {}
+        return answer, {}
 
     # 2. 取出被引用 section 的原文
     cited_texts = []
@@ -659,42 +638,33 @@ def _verify_evidence(answer: str, chunk_registry: dict,
             cited_texts.append(
                 f"[Section {sec}] ({entry['book']}, chars {entry['start']}-{entry['end']})\n{text_preview}"
             )
-    # If too many sections cited, sample the most important ones
     if len(cited_texts) > max_sections:
         cited_texts = cited_texts[:max_sections]
         cited_texts.append("... (余下 cited sections 省略)")
 
     if not cited_texts:
-        msg = "\n\n[EVIDENCE]\n(引用的 sections 在 registry 中未找到对应原文。)\n[/EVIDENCE]"
-        return msg, {}
+        return answer, {}
 
     cited_sections_text = "\n\n---\n\n".join(cited_texts)
 
-    # 3. 调用 LLM 提取证据
-    qa_hint = (
-        "\n\nThe answer contains multiple QA pairs (Q1, Q2, ...). "
-        "For each evidence block, identify which Q number the claim belongs to "
-        "and include it in the output as 'Q: <number>'."
-        if is_qa else ""
-    )
+    # 3. 调用 LLM 在原 JSON 上补充 evidence 字段
     msgs = [
         {"role": "system", "content": EVIDENCE_VERIFICATION_PROMPT},
         {"role": "user", "content": (
             f"CITED SECTIONS (original text):\n{cited_sections_text}\n\n"
-            f"QUESTION: {question or 'N/A'}{qa_hint}\n\n"
-            f"ANSWER:\n{answer}"
+            f"QA ARRAY:\n{json.dumps(qa_list, ensure_ascii=False, indent=2)}"
         )},
     ]
 
     try:
-        evidence = _call_model(msgs, 4096)
-    except Exception as e:
-        evidence = f"\n\n[EVIDENCE]\n(证据验证调用失败: {e})\n[/EVIDENCE]"
-        return "\n\n" + evidence.strip(), {}
+        result_text = _call_model(msgs, 4096)
+        # 验证返回的是合法 JSON
+        enriched = json.loads(result_text)
+    except Exception:
+        return answer, {}
 
-    evidence_full = "\n\n" + evidence.strip()
-    per_q = _group_evidence_by_q(evidence) if is_qa else {}
-    return evidence_full, per_q
+    per_q = _group_evidence_by_q(result_text)
+    return result_text.strip(), per_q
 
 
 def _save_triples_csv(triples: list[dict]) -> str:
@@ -823,22 +793,14 @@ def process_books(selected_names: list[str],
         print(f"  Verifying evidence from original text...")
         evidence_text, per_q_evidence = _verify_evidence(answer, chunk_registry, question)
 
-    # 格式化最终输出：QA 模式 → Q/A/E 交错；单问题模式 → 附带证据块
-    is_qa = _is_auto_qa_answer(answer)
-    if is_qa:
-        qa_pairs = _parse_qa_pairs(answer)
-        formatted_parts: list[str] = []
-        for qnum, qtext, atext in qa_pairs:
-            atext_clean = _strip_section_refs(atext)
-            formatted_parts.append(f"Q{qnum}: {qtext}\nA{qnum}: {atext_clean}")
-            if per_q_evidence:
-                quotes = per_q_evidence.get(qnum, [])
-                if quotes:
-                    joined = "; ".join(f'"{q}"' for q in quotes)
-                    formatted_parts.append(f"E{qnum}: {joined}")
-        answer_with_evidence = "\n\n".join(formatted_parts)
-    else:
-        answer_with_evidence = answer + evidence_text
+    # 格式化最终输出：evidence 验证成功则用补充后的 JSON
+    final_json = evidence_text if evidence_text and per_q_evidence else answer
+    # 规范化 JSON 输出
+    try:
+        parsed = json.loads(final_json)
+        answer_with_evidence = json.dumps(parsed, ensure_ascii=False, indent=2)
+    except json.JSONDecodeError:
+        answer_with_evidence = final_json
 
     # 清理进度文件
     if resume_path and os.path.exists(resume_path):
