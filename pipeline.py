@@ -664,7 +664,7 @@ def _verify_evidence(answer: str, chunk_registry: dict,
     ]
 
     try:
-        result_text = _call_model(msgs, 4096)
+        result_text = _call_model(msgs, MAX_TOKENS_ANSWER)
         cleaned = _strip_code_fence(result_text)
         enriched = json.loads(cleaned)
     except Exception as e:

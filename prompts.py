@@ -358,5 +358,6 @@ Output format — a JSON array of objects, same as input but with an "evidence" 
     ...
 ]
 
+IMPORTANT: Escape any double quotes (") inside verbatim evidence with backslashes (\").
 If no evidence can be found for any QA pair, return the input array unchanged (without evidence field).
 Return ONLY the JSON array, no other text."""
