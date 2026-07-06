@@ -560,18 +560,41 @@ def _parse_qa_pairs(answer: str) -> list[tuple[int, str, str]]:
 
 def _group_evidence_by_q(evidence_text: str) -> dict[int, list[str]]:
     """将证据文本按 Q 编号分组。
-    返回 {q_number: [verbatim_quote, ...]}"""
+    返回 {q_number: [verbatim_quote, ...]}
+    如果证据块没有 Q 编号，按出现顺序分配。"""
     by_q: dict[int, list[str]] = {}
-    for em in re.finditer(r'\[EVIDENCE\](.*?)\[/EVIDENCE\]', evidence_text, re.DOTALL | re.IGNORECASE):
+    # 按出现顺序收集所有证据块
+    unassigned: list[str] = []
+
+    for em in re.finditer(r'\[EVIDENCE\]\s*(.*?)\s*\[/EVIDENCE\]', evidence_text, re.DOTALL | re.IGNORECASE):
         block = em.group(1)
+
+        # 提取 Q 编号
         qm = re.search(r'Q:\s*(\d+)', block)
-        vm = re.search(r'Verbatim Evidence:\s*"(.*?)"', block)
-        if qm and vm:
-            qnum = int(qm.group(1))
-            quote = vm.group(1).strip()
-            if qnum not in by_q:
-                by_q[qnum] = []
-            by_q[qnum].append(quote)
+        qnum = int(qm.group(1)) if qm else None
+
+        # 提取 Verbatim Evidence：从 "Verbatim Evidence:" 后的第一个 " 到最后一个 "
+        quote = None
+        vi = block.find('Verbatim Evidence:')
+        if vi >= 0:
+            qs = block.find('"', vi)
+            if qs >= 0:
+                qe = block.rfind('"', qs + 1)
+                if qe > qs:
+                    quote = block[qs + 1:qe].strip()
+
+        if quote:
+            if qnum is not None:
+                by_q.setdefault(qnum, []).append(quote)
+            else:
+                unassigned.append(quote)
+
+    # 如果没有 Q 编号的证据，按出现顺序分配给 1, 2, 3...
+    if unassigned:
+        max_q = max(by_q.keys()) if by_q else 0
+        for i, q in enumerate(unassigned, 1):
+            by_q.setdefault(max_q + i, []).append(q)
+
     return by_q
 
 
@@ -638,7 +661,7 @@ def _verify_evidence(answer: str, chunk_registry: dict,
 
     # 3. 调用 LLM 提取证据
     qa_hint = (
-        "\n\nThe answer containes multiple QA pairs (Q1, Q2, ...). "
+        "\n\nThe answer contains multiple QA pairs (Q1, Q2, ...). "
         "For each evidence block, identify which Q number the claim belongs to "
         "and include it in the output as 'Q: <number>'."
         if is_qa else ""
