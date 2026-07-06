@@ -8,7 +8,7 @@ import os
 
 # ============ API 配置 ============
 API_BASE = "https://api.v3.cm/v1"
-API_KEY = os.environ.get("API_KEY", "k-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
+API_KEY = os.environ.get("API_KEY", "sk-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
 MODEL = "claude-sonnet-5"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
@@ -18,7 +18,7 @@ OVERLAP = 1000
 STRIDE = WINDOW_SIZE - OVERLAP
 
 # ============ 并发 & 令牌 ============
-WORKERS = 2
+WORKERS = 8
 MAX_TOKENS_SUMMARIZE = 2048
 MAX_TOKENS_ANSWER = 8192
 MAX_RETRIES = 2
