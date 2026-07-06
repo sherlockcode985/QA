@@ -28,7 +28,7 @@ ENABLE_TRIPLE_INPUT: bool = False
 ENABLE_EVIDENCE_VERIFICATION: bool = True
 
 # 是否开启对抗式三元组抽取。True=正常抽取三元组；False=仅做文本总结与QA生成，跳过所有三元组相关步骤。
-ENABLE_TRIPLE_EXTRACTION: bool = True
+ENABLE_TRIPLE_EXTRACTION: bool = False
 
 # 默认三元组示例（当 ENABLE_TRIPLE_INPUT=True 但同学想直接用常量里的示例时修改此处）
 # 格式：subject||predicate||object，一行一个
