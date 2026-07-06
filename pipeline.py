@@ -658,13 +658,17 @@ def _verify_evidence(answer: str, chunk_registry: dict,
 
     try:
         result_text = _call_model(msgs, 4096)
-        # 验证返回的是合法 JSON
-        enriched = json.loads(result_text)
-    except Exception:
+        # 清理 LLM 可能加的 markdown 代码块包裹
+        cleaned = re.sub(r'^```(?:json)?\s*\n?', '', result_text.strip(), flags=re.IGNORECASE)
+        cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.IGNORECASE)
+        enriched = json.loads(cleaned)
+    except Exception as e:
+        print(f"  [Evidence] 验证失败: {e}")
         return answer, {}
 
-    per_q = _group_evidence_by_q(result_text)
-    return result_text.strip(), per_q
+    per_q = _group_evidence_by_q(cleaned)
+    print(f"  [Evidence] 验证完成, {sum(len(v) for v in per_q.values())} 条证据")
+    return cleaned, per_q
 
 
 def _save_triples_csv(triples: list[dict]) -> str:
