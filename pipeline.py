@@ -545,6 +545,13 @@ def _post_process_triples(triples: list[dict]) -> list[dict]:
     return triples
 
 
+def _strip_code_fence(text: str) -> str:
+    """去掉 LLM 在 JSON 外包的 ```json 代码块标记"""
+    s = re.sub(r'^```(?:json)?\s*\n?', '', text.strip(), flags=re.IGNORECASE)
+    s = re.sub(r'\n?```\s*$', '', s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def _parse_qa_pairs(answer: str) -> list[tuple[int, str, str]]:
     """从 JSON 格式的 QA 数组中解析单个 Q/A 对。
     返回 [(index, question_text, answer_text), ...]"""
@@ -658,9 +665,7 @@ def _verify_evidence(answer: str, chunk_registry: dict,
 
     try:
         result_text = _call_model(msgs, 4096)
-        # 清理 LLM 可能加的 markdown 代码块包裹
-        cleaned = re.sub(r'^```(?:json)?\s*\n?', '', result_text.strip(), flags=re.IGNORECASE)
-        cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.IGNORECASE)
+        cleaned = _strip_code_fence(result_text)
         enriched = json.loads(cleaned)
     except Exception as e:
         print(f"  [Evidence] 验证失败: {e}")
@@ -766,7 +771,7 @@ def process_books(selected_names: list[str],
         ]
 
     t0 = time.time()
-    answer = _call_model(answer_messages, MAX_TOKENS_ANSWER)
+    answer = _strip_code_fence(_call_model(answer_messages, MAX_TOKENS_ANSWER))
     answer_time = time.time() - t0
 
     # 保存三元组 CSV
