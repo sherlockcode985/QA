@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 # ============ 配置 ============
-API_BASE = "http://162.105.19.243:11451/v1"
+API_BASE = "http://162.105.19.152:11451/v1"
 API_KEY = os.environ.get("API_KEY", "sulab")
 MODEL = "Qwen3.6-27B"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
@@ -91,7 +91,7 @@ PREDICATE_NORMALIZATION = {
     "拜访": "VISITS", "访问": "VISITS",
 }
 
-client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=120.0)
+client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=300.0)
 
 
 # ============ 滑动窗口 ============
@@ -128,6 +128,7 @@ def _call_model(messages: list, max_tokens: int) -> str:
             messages=messages,
             temperature=0.3,
             max_tokens=max_tokens,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         return resp.choices[0].message.content or ""
     except Exception as e:

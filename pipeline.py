@@ -29,6 +29,7 @@ from config import (
 from prompts import (
     ENABLE_QUESTION_INPUT,
     ENABLE_TRIPLE_INPUT,
+    ENABLE_TRIPLE_EXTRACTION,
     TRIPLE_INSTRUCTION,
     SUMMARIZE_CHUNK_PROMPT,
     EXTRACT_TRIPLES_PROMPT,
@@ -40,7 +41,7 @@ from prompts import (
     QA_GENERATION_PROMPT,
 )
 
-client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=120.0)
+client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=300.0)
 
 
 # ============ 滑动窗口 ============
@@ -77,6 +78,7 @@ def _call_model(messages: list, max_tokens: int) -> str:
             messages=messages,
             temperature=0.3,
             max_tokens=max_tokens,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         return resp.choices[0].message.content or ""
     except Exception as e:
@@ -175,23 +177,27 @@ def _revise_triples(summary: str, window_text: str,
 def summarize_one_adversarial(window_text: str, book_name: str,
                               idx: int, total: int) -> tuple[str, list[tuple[str, str, str]]]:
     """对抗式多步总结：总结 → 抽取 → 校验 → 修正（最多 MAX_ITERATIONS 轮）
-    线程安全，返回 (summary, [(subject, predicate, object), ...])"""
+    线程安全，返回 (summary, [(subject, predicate, object), ...])
+    当 ENABLE_TRIPLE_EXTRACTION=False 时跳过三元组相关步骤。"""
     for attempt in range(MAX_RETRIES + 1):
         try:
             # Step 1: 总结
             summary = _summarize_chunk(window_text, book_name, idx, total)
 
-            # Step 2: 抽取
-            triples = _extract_triples(summary, window_text)
+            # 三元组抽取开关
+            triples: list[tuple[str, str, str]] = []
+            if ENABLE_TRIPLE_EXTRACTION:
+                # Step 2: 抽取
+                triples = _extract_triples(summary, window_text)
 
-            # Step 3-4: 校验→修正 循环
-            if triples:
-                for iteration in range(MAX_ITERATIONS):
-                    passed, feedback = _validate_triples(triples, window_text)
-                    if passed:
-                        break
-                    if iteration < MAX_ITERATIONS - 1:
-                        triples = _revise_triples(summary, window_text, triples, feedback)
+                # Step 3-4: 校验→修正 循环
+                if triples:
+                    for iteration in range(MAX_ITERATIONS):
+                        passed, feedback = _validate_triples(triples, window_text)
+                        if passed:
+                            break
+                        if iteration < MAX_ITERATIONS - 1:
+                            triples = _revise_triples(summary, window_text, triples, feedback)
 
             if summary:
                 return summary, triples
@@ -646,6 +652,7 @@ def interactive():
     print("Long Text Comprehension Pipeline (Parallel)")
     print(f"Model: {MODEL} | Workers: {WORKERS}")
     print(f"Window: {WINDOW_SIZE}ch | Overlap: {OVERLAP}ch")
+    print(f"Triple extraction: {'ON' if ENABLE_TRIPLE_EXTRACTION else 'OFF'}")
     print("=" * 60)
 
     books = load_books()

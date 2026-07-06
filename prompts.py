@@ -24,6 +24,9 @@ ENABLE_QUESTION_INPUT: bool = True
 # 是否需要输入三元组来引导生成。True=在交互界面输入三元组引导；False=不输入三元组，完全靠提示词。
 ENABLE_TRIPLE_INPUT: bool = False
 
+# 是否开启对抗式三元组抽取。True=正常抽取三元组；False=仅做文本总结与QA生成，跳过所有三元组相关步骤。
+ENABLE_TRIPLE_EXTRACTION: bool = True
+
 # 默认三元组示例（当 ENABLE_TRIPLE_INPUT=True 但同学想直接用常量里的示例时修改此处）
 # 格式：subject||predicate||object，一行一个
 DEFAULT_TRIPLE_EXAMPLE: str = """Gabriel Oak||HAS_ROLE||Shepherd

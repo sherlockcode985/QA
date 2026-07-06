@@ -7,7 +7,7 @@
 import os
 
 # ============ API 配置 ============
-API_BASE = "http://162.105.19.243:11451/v1"
+API_BASE = "http://162.105.19.152:11451/v1"
 API_KEY = os.environ.get("API_KEY", "sulab")
 MODEL = "Qwen3.6-27B"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
