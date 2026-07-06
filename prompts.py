@@ -340,9 +340,12 @@ RULES:
 - Be honest — do not fabricate or stretch evidence. "Not found" is a valid answer.
 - Only use the sections actually cited for each claim. Do not use other sections to fill gaps.
 
+For auto-generated QA pairs (answer contains Q1/Q2/Q3...), identify which Q number each claim belongs to and include it in the output.
+
 Output format — ONE [EVIDENCE] block per claim:
 
 [EVIDENCE]
+Q: <Q number, or "N/A" for single-question answer>
 Claim: <restate the specific claim>
 Section(s): <N>
 Verbatim Evidence: "<exact quote from the original text>"
