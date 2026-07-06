@@ -41,7 +41,7 @@ from prompts import (
     QA_GENERATION_PROMPT,
 )
 
-client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=300.0)
+client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=600.0)
 
 
 # ============ 滑动窗口 ============

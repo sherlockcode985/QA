@@ -26,7 +26,7 @@ OVERLAP = 1000
 STRIDE = WINDOW_SIZE - OVERLAP
 
 # --- 并行 ---
-WORKERS = 8
+WORKERS = 2
 MAX_RETRIES = 2
 
 # --- Token 限制 ---
@@ -91,7 +91,7 @@ PREDICATE_NORMALIZATION = {
     "拜访": "VISITS", "访问": "VISITS",
 }
 
-client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=300.0)
+client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=600.0)
 
 
 # ============ 滑动窗口 ============
