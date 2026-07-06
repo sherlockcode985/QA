@@ -795,9 +795,15 @@ def process_books(selected_names: list[str],
 
     # 格式化最终输出：evidence 验证成功则用补充后的 JSON
     final_json = evidence_text if evidence_text and per_q_evidence else answer
-    # 规范化 JSON 输出
+    # 去掉 answer 中的 [Section N] 引用
     try:
         parsed = json.loads(final_json)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if "answer" in item:
+                    item["answer"] = _strip_section_refs(item["answer"])
+        elif isinstance(parsed, dict) and "answer" in parsed:
+            parsed["answer"] = _strip_section_refs(parsed["answer"])
         answer_with_evidence = json.dumps(parsed, ensure_ascii=False, indent=2)
     except json.JSONDecodeError:
         answer_with_evidence = final_json
