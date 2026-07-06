@@ -7,9 +7,9 @@
 import os
 
 # ============ API 配置 ============
-API_BASE = "http://162.105.19.152:11451/v1"
-API_KEY = os.environ.get("API_KEY", "sulab")
-MODEL = "Qwen3.6-27B"
+API_BASE = "https://api.v3.cm/v1"
+API_KEY = os.environ.get("API_KEY", "k-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
+MODEL = "claude-sonnet-5"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
 # ============ 滑动窗口 ============
@@ -23,3 +23,7 @@ MAX_TOKENS_SUMMARIZE = 2048
 MAX_TOKENS_ANSWER = 8192
 MAX_RETRIES = 2
 MAX_ITERATIONS = 3  # 对抗系统：抽取→校验 最大迭代次数
+
+# ============ API 调用重试（应对不稳定 API） ============
+API_MAX_RETRIES = 5      # 每次 API 调用的最大重试次数（指数退避）
+API_RETRY_BASE_DELAY = 2  # 基础等待秒数（第 N 次重试等待 = base * N）

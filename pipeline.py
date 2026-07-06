@@ -25,11 +25,13 @@ from config import (
     API_BASE, API_KEY, MODEL, DATA_DIR,
     WINDOW_SIZE, OVERLAP, STRIDE,
     WORKERS, MAX_TOKENS_SUMMARIZE, MAX_TOKENS_ANSWER, MAX_RETRIES, MAX_ITERATIONS,
+    API_MAX_RETRIES, API_RETRY_BASE_DELAY,
 )
 from prompts import (
     ENABLE_QUESTION_INPUT,
     ENABLE_TRIPLE_INPUT,
     ENABLE_TRIPLE_EXTRACTION,
+    ENABLE_EVIDENCE_VERIFICATION,
     TRIPLE_INSTRUCTION,
     SUMMARIZE_CHUNK_PROMPT,
     EXTRACT_TRIPLES_PROMPT,
@@ -39,6 +41,7 @@ from prompts import (
     ENTITY_CANON_USER_PROMPT,
     ANSWER_SYSTEM_PROMPT,
     QA_GENERATION_PROMPT,
+    EVIDENCE_VERIFICATION_PROMPT,
 )
 
 client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=600.0)
@@ -72,17 +75,26 @@ def sliding_window_chunks(text: str, window_size: int = WINDOW_SIZE,
 # ============ 模型调用 ============
 
 def _call_model(messages: list, max_tokens: int) -> str:
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=max_tokens,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as e:
-        raise RuntimeError(f"API call failed: {e}")
+    """调用 LLM，带指数退避重试。
+    重试次数由 config.py 中的 API_MAX_RETRIES 控制。
+    """
+    for attempt in range(API_MAX_RETRIES + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=max_tokens,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            if attempt < API_MAX_RETRIES:
+                delay = API_RETRY_BASE_DELAY * (attempt + 1)
+                print(f"  [Retry {attempt + 1}/{API_MAX_RETRIES}] API call failed, waiting {delay}s: {e}")
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"API call failed after {API_MAX_RETRIES + 1} attempts: {e}")
 
 
 def _parse_triples_block(text: str) -> list[tuple[str, str, str]]:
@@ -533,6 +545,73 @@ def _post_process_triples(triples: list[dict]) -> list[dict]:
     return triples
 
 
+def _verify_evidence(answer: str, chunk_registry: dict,
+                      question: str | None = None,
+                      max_sections: int = 30) -> str:
+    """从原文中为答案中的每个事实性陈述提取逐字证据。
+
+    answer 中应包含 [Section N] 引用，函数会：
+    1. 解析出所有被引用的 section
+    2. 从 chunk_registry 中取出对应的原文
+    3. 调用 LLM 提取逐字证据
+    """
+    # 1. 解析答案中引用的所有 section 编号
+    cited: set[int] = set()
+    # Pattern 1: [Section N] or [Sections N-M] (range via hyphen/dash)
+    for m in re.finditer(r'\[Section(?:s)?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]', answer, re.IGNORECASE):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        for s in range(start, end + 1):
+            cited.add(s)
+    # Pattern 2: [Sections N, M, ...] (comma-separated list)
+    for m in re.finditer(r'\[Section(?:s)?\s+(\d+(?:\s*,\s*\d+)+)\]', answer, re.IGNORECASE):
+        for token in re.split(r'\s*,\s*', m.group(1)):
+            s = int(token.strip())
+            if 1 <= s <= len(chunk_registry) * 2:
+                cited.add(s)
+
+    if not cited:
+        return "\n\n[EVIDENCE]\n(答案中未发现 [Section N] 引用，无法验证原文证据。)\n[/EVIDENCE]"
+
+    # 2. 取出被引用 section 的原文
+    cited_texts = []
+    for sec in sorted(cited):
+        if sec in chunk_registry:
+            entry = chunk_registry[sec]
+            text_preview = entry["text"]
+            if len(text_preview) > 3000:
+                text_preview = text_preview[:1500] + "\n...[...]...\n" + text_preview[-1500:]
+            cited_texts.append(
+                f"[Section {sec}] ({entry['book']}, chars {entry['start']}-{entry['end']})\n{text_preview}"
+            )
+    # If too many sections cited, sample the most important ones
+    if len(cited_texts) > max_sections:
+        cited_texts = cited_texts[:max_sections]
+        cited_texts.append("... (余下 cited sections 省略)")
+
+    if not cited_texts:
+        return "\n\n[EVIDENCE]\n(引用的 sections 在 registry 中未找到对应原文。)\n[/EVIDENCE]"
+
+    cited_sections_text = "\n\n---\n\n".join(cited_texts)
+
+    # 3. 调用 LLM 提取证据
+    msgs = [
+        {"role": "system", "content": EVIDENCE_VERIFICATION_PROMPT},
+        {"role": "user", "content": (
+            f"CITED SECTIONS (original text):\n{cited_sections_text}\n\n"
+            f"QUESTION: {question or 'N/A'}\n\n"
+            f"ANSWER:\n{answer}"
+        )},
+    ]
+
+    try:
+        evidence = _call_model(msgs, 4096)
+    except Exception as e:
+        evidence = f"\n\n[EVIDENCE]\n(证据验证调用失败: {e})\n[/EVIDENCE]"
+
+    return "\n\n" + evidence.strip()
+
+
 def _save_triples_csv(triples: list[dict]) -> str:
     """保存三元组到 CSV 文件"""
     out_dir = os.path.join(os.path.dirname(__file__), "output")
@@ -559,6 +638,8 @@ def process_books(selected_names: list[str],
     t_start = time.time()
     all_tasks = []
     total_windows = 0
+    out_dir = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(out_dir, exist_ok=True)
 
     for name in selected_names:
         content = get_book_content(name)
@@ -576,6 +657,17 @@ def process_books(selected_names: list[str],
             })
         total_windows += section_total
         print(f"  [{name}] {section_total} windows")
+
+    # 构建 Chunk Registry：section_idx → {book, start, end, text}
+    chunk_registry: dict[int, dict] = {}
+    for t in all_tasks:
+        chunk_registry[t["global_idx"]] = {
+            "book": t["book_name"],
+            "section_within_book": t["section_idx"],
+            "start": t.get("start", 0),
+            "end": t.get("end", 0),
+            "text": t["text"],
+        }
 
     # 并行总结
     sorted_results, all_triples = summarize_all_parallel(all_tasks, WORKERS, resume_path)
@@ -623,17 +715,46 @@ def process_books(selected_names: list[str],
     if all_triples:
         csv_path = _save_triples_csv(all_triples)
 
+    # 保存 Chunk Registry
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    registry_path = os.path.join(out_dir, f"chunk_registry_{ts}.json")
+    # 保存时去掉原文 text 以减少体积（仅保留 start/end/book 用于追溯）
+    registry_slim = {}
+    for idx, entry in chunk_registry.items():
+        registry_slim[str(idx)] = {
+            "book": entry["book"],
+            "start": entry["start"],
+            "end": entry["end"],
+            "section_within_book": entry["section_within_book"],
+        }
+    with open(registry_path, "w", encoding="utf-8") as f:
+        json.dump(registry_slim, f, ensure_ascii=False, indent=2)
+    print(f"  Chunk registry saved: {registry_path}")
+
+    # 原文证据验证
+    evidence_text = ""
+    if ENABLE_EVIDENCE_VERIFICATION and answer.strip():
+        print(f"  Verifying evidence from original text...")
+        evidence_text = _verify_evidence(answer, chunk_registry, question)
+        # 将证据追加到答案中
+        answer_with_evidence = answer + evidence_text
+    else:
+        answer_with_evidence = answer
+
     # 清理进度文件
     if resume_path and os.path.exists(resume_path):
         os.remove(resume_path)
 
     return {
         "answer": answer,
+        "answer_with_evidence": answer_with_evidence,
+        "evidence_text": evidence_text,
         "total_windows": total_windows,
         "total_time": time.time() - t_start,
         "answer_time": answer_time,
         "triples_count": len(all_triples),
         "triples_csv": csv_path,
+        "registry_path": registry_path,
     }
 
 
@@ -739,6 +860,8 @@ def interactive():
         print("Auto-generated QA Pairs:")
     print(f"{'='*60}\n")
     print(result["answer"])
+    if result.get("evidence_text"):
+        print(result["evidence_text"])
     print(f"\n{'='*60}")
     print(f"Time: {result['total_time']:.0f}s | Windows: {result['total_windows']} | Triples: {result.get('triples_count', 0)}")
 
@@ -749,9 +872,9 @@ def interactive():
     out_path = os.path.join(out_dir, f"result_{ts}.txt")
     with open(out_path, "w", encoding="utf-8") as f:
         if question:
-            f.write(f"Q: {question}\n\nA:\n{result['answer']}\n\n")
+            f.write(f"Q: {question}\n\nA:\n{result['answer_with_evidence']}\n\n")
         else:
-            f.write(f"Auto-generated QA Pairs:\n\n{result['answer']}\n\n")
+            f.write(f"Auto-generated QA Pairs:\n\n{result['answer_with_evidence']}\n\n")
         f.write(f"--- Stats ---\n")
         f.write(f"Workers: {WORKERS}\n")
         f.write(f"Windows: {result['total_windows']}\n")
@@ -759,6 +882,8 @@ def interactive():
         f.write(f"Triples: {result.get('triples_count', 0)}\n")
         if result.get('triples_csv'):
             f.write(f"Triples CSV: {result['triples_csv']}\n")
+        if result.get('registry_path'):
+            f.write(f"Chunk Registry: {result['registry_path']}\n")
     print(f"\nSaved: {out_path}")
     if result.get('triples_csv'):
         print(f"Triples CSV: {result['triples_csv']}")

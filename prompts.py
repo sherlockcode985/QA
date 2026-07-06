@@ -24,6 +24,9 @@ ENABLE_QUESTION_INPUT: bool = True
 # 是否需要输入三元组来引导生成。True=在交互界面输入三元组引导；False=不输入三元组，完全靠提示词。
 ENABLE_TRIPLE_INPUT: bool = False
 
+# 是否启用原文证据验证。True=生成答案后，从原文中提取逐字证据来支撑答案中的每个事实性陈述。
+ENABLE_EVIDENCE_VERIFICATION: bool = True
+
 # 是否开启对抗式三元组抽取。True=正常抽取三元组；False=仅做文本总结与QA生成，跳过所有三元组相关步骤。
 ENABLE_TRIPLE_EXTRACTION: bool = True
 
@@ -284,7 +287,14 @@ canonical_name
 
 ANSWER_SYSTEM_PROMPT: str = (
     "You are given section summaries of one or more books. "
-    "Answer based on ALL summaries. Cite sections as evidence."
+    "Answer based on ALL summaries.\n\n"
+    "CRITICAL — For EACH factual claim you make, cite its source section(s) in brackets, "
+    "like [Section 3] or [Sections 3-5]. "
+    "Every distinct fact (character introduction, event, relationship, plot point) must be "
+    "attributed to a specific section. This enables automated evidence verification.\n\n"
+    "If a claim spans multiple sections, list all of them: [Sections 3, 7, 12].\n"
+    "If the question has multiple sub-parts, organize your answer with clear "
+    "paragraphs or bullet points, each with its own citations."
 )
 
 QA_GENERATION_PROMPT: str = """You are given section summaries of one or more books.
@@ -294,13 +304,52 @@ Each QA pair should test deep understanding of characters, relationships, events
 Requirements:
 - Questions should be diverse: some about characters, some about events, some about relationships.
 - Answers should be accurate and cite specific details from the summaries.
+- CRITICAL: For each factual claim in each answer, cite the source section(s) in brackets:
+  [Section 3] or [Sections 5-7]. Every distinct fact must have a citation.
 - Avoid yes/no questions; prefer open-ended questions requiring reasoning.
 
 Output format:
 [QA_PAIRS]
 Q1: <question>
-A1: <answer>
+A1: <answer with [Section N] citations>
 
 Q2: <question>
-A2: <answer>
+A2: <answer with [Section N] citations>
 [/QA_PAIRS]"""
+
+
+# ============ 原文证据验证提示词 ============
+
+EVIDENCE_VERIFICATION_PROMPT: str = """You are a literary evidence verification expert. Your task is to find VERBATIM supporting evidence from original text sections for each factual claim in an answer.
+
+You will receive:
+1. A QUESTION (or "N/A" for auto-generated QA)
+2. An ANSWER containing claims with [Section N] citations
+3. The ORIGINAL TEXT of the cited sections
+
+For EACH factual claim in the answer:
+1. Locate it in the answer text
+2. Read the corresponding original text section(s)
+3. Find a VERBATIM (exact, word-for-word) quote from the original text that directly supports the claim
+4. Output the evidence in the specified format
+
+RULES:
+- Evidence MUST be exact quotes from the original text — no paraphrasing, no rewording
+- If a claim has support but no single sentence captures it, use the most relevant 1-3 consecutive sentences
+- If a claim CANNOT be supported by any text in the cited sections, mark it as [UNSUPPORTED]
+- Be honest — do not fabricate or stretch evidence. "Not found" is a valid answer.
+- Only use the sections actually cited for each claim. Do not use other sections to fill gaps.
+
+Output format — ONE [EVIDENCE] block per claim:
+
+[EVIDENCE]
+Claim: <restate the specific claim>
+Section(s): <N>
+Verbatim Evidence: "<exact quote from the original text>"
+[/EVIDENCE]
+
+If the answer makes many claims, produce evidence for each. If NO claim can be supported:
+
+[NO_EVIDENCE_FOUND]
+Explanation: <brief reason>
+[/NO_EVIDENCE_FOUND]"""
