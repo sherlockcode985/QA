@@ -558,6 +558,17 @@ def _parse_qa_pairs(answer: str) -> list[tuple[int, str, str]]:
     return pairs
 
 
+_SECTION_RE = re.compile(
+    r'\s*\[Section(?:s)?\s*(\d+(?:\s*[-–—,]\s*\d+)*(?:\s*,\s*\d+)*)\]',
+    re.IGNORECASE
+)
+
+
+def _strip_section_refs(text: str) -> str:
+    """去掉答案中的 [Section N] 引用标记，仅用于显示。"""
+    return _SECTION_RE.sub('', text).strip()
+
+
 def _group_evidence_by_q(evidence_text: str) -> dict[int, list[str]]:
     """将证据文本按 Q 编号分组。
     返回 {q_number: [verbatim_quote, ...]}
@@ -814,15 +825,17 @@ def process_books(selected_names: list[str],
 
     # 格式化最终输出：QA 模式 → Q/A/E 交错；单问题模式 → 附带证据块
     is_qa = _is_auto_qa_answer(answer)
-    if is_qa and per_q_evidence:
+    if is_qa:
         qa_pairs = _parse_qa_pairs(answer)
         formatted_parts: list[str] = []
         for qnum, qtext, atext in qa_pairs:
-            formatted_parts.append(f"Q{qnum}: {qtext}\nA{qnum}: {atext}")
-            quotes = per_q_evidence.get(qnum, [])
-            if quotes:
-                joined = "; ".join(f'"{q}"' for q in quotes)
-                formatted_parts.append(f"E{qnum}: {joined}")
+            atext_clean = _strip_section_refs(atext)
+            formatted_parts.append(f"Q{qnum}: {qtext}\nA{qnum}: {atext_clean}")
+            if per_q_evidence:
+                quotes = per_q_evidence.get(qnum, [])
+                if quotes:
+                    joined = "; ".join(f'"{q}"' for q in quotes)
+                    formatted_parts.append(f"E{qnum}: {joined}")
         answer_with_evidence = "\n\n".join(formatted_parts)
     else:
         answer_with_evidence = answer + evidence_text
