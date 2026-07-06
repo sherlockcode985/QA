@@ -7,9 +7,9 @@
 import os
 
 # ============ API 配置 ============
-API_BASE = "https://api.v3.cm/v1"
-API_KEY = os.environ.get("API_KEY", "sk-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
-MODEL = "claude-sonnet-5"
+API_BASE = "http://162.105.19.243:11451/v1"
+API_KEY = os.environ.get("API_KEY", "sulab")
+MODEL = "Qwen3.6-27B"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
 # ============ 滑动窗口 ============
@@ -18,7 +18,7 @@ OVERLAP = 1000
 STRIDE = WINDOW_SIZE - OVERLAP
 
 # ============ 并发 & 令牌 ============
-WORKERS = 6
+WORKERS = 8
 MAX_TOKENS_SUMMARIZE = 2048
 MAX_TOKENS_ANSWER = 8192
 MAX_RETRIES = 2
