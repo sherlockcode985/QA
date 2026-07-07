@@ -924,10 +924,9 @@ def interactive():
         print("Cancelled.")
         return
 
-    resume_path = os.path.join(os.path.dirname(__file__), "output", ".progress.json")
     result = process_books(selected, question=question,
                            triples_guide=triples_guide,
-                           resume_path=resume_path)
+                           resume_path=None)
 
     # ── 输出结果 ──
     print(f"\n{'='*60}")
