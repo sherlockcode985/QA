@@ -565,6 +565,40 @@ def _post_process_triples(triples: list[dict]) -> list[dict]:
     return triples
 
 
+def _normalize_text(text: str) -> str:
+    """统一所有可能造成匹配失败的文本差异，用于 evidence 软匹配"""
+    import unicodedata
+    t = text.replace('\\"', '"').replace("\\'", "'")
+    t = re.sub(r'\\n', '\n', t)
+    # Unicode 正规化：弯引号→直引号，非断空格→空格，全角→半角等
+    t = unicodedata.normalize('NFKC', t)
+    # 常见标点变体统一
+    t = t.replace('—', '--').replace('–', '-')  # 长/短破折号
+    t = t.replace('…', '...')  # 省略号
+    t = re.sub(r'\s+', ' ', t).strip().lower()
+    return t
+
+
+def _evidence_confidence(evidence: str, source_text: str) -> float:
+    """计算 evidence 在原文中的匹配置信度 0~1，不做硬丢弃"""
+    ev = _normalize_text(evidence)
+    src = _normalize_text(source_text)
+    if ev in src:
+        return 1.0
+    # 滑动窗口找最长连续匹配比例
+    ev_len = len(ev)
+    best = 0
+    # 只看合理长度的窗口（至少 20 字符，不超过原文最长匹配）
+    for start in range(ev_len):
+        for end in range(start + 20, min(start + ev_len, ev_len) + 1):
+            chunk = ev[start:end]
+            if chunk in src:
+                best = max(best, (end - start) / ev_len)
+            else:
+                break
+    return best
+
+
 def _strip_code_fence(text: str) -> str:
     """去掉 LLM 在 JSON 外包的 ```json 代码块标记"""
     s = re.sub(r'^```(?:json)?\s*\n?', '', text.strip(), flags=re.IGNORECASE)
@@ -619,7 +653,8 @@ def _is_auto_qa_answer(answer: str) -> bool:
 
 def _verify_evidence(answer: str, chunk_registry: dict,
                       question: str | None = None,
-                      max_sections: int = 30) -> tuple[str, dict[int, list[str]]]:
+                      max_sections: int = 30,
+                      out_dir: str | None = None) -> tuple[str, dict[int, list[str]]]:
     """从原文中为 JSON 格式的 QA 数组提取逐字证据。
 
     answer 应为 JSON 数组/对象，answer/response 字段含 [Section N] 引用。
@@ -683,7 +718,40 @@ def _verify_evidence(answer: str, chunk_registry: dict,
         return answer, {}
 
     per_q = _group_evidence_by_q(cleaned)
-    print(f"  [Evidence] 验证完成, {sum(len(v) for v in per_q.values())} 条证据")
+    total_ev = sum(len(v) for v in per_q.values())
+    print(f"  [Evidence] 验证完成, {total_ev} 条证据")
+
+    # ── 软校验：检查每条 evidence 在原文中是否有匹配 ──
+    low_conf: list[tuple[int, int, str, float]] = []  # (qa_idx, ev_idx, snippet, score)
+    combined_src = "\n".join(
+        re.sub(r'\[(\d+)\] \(.*?\)\n', '', s)
+        for s in cited_texts
+    )
+    for q_idx, ev_list in per_q.items():
+        for ev_i, ev_text in enumerate(ev_list):
+            conf = _evidence_confidence(ev_text, combined_src)
+            if conf < 0.5:
+                snippet = ev_text[:80].replace('\n', ' ')
+                low_conf.append((q_idx, ev_i, snippet, conf))
+
+    if low_conf:
+        print(f"  [Evidence] 软校验: {len(low_conf)}/{total_ev} 条置信度偏低 (<0.5):")
+        for q_idx, ev_i, snippet, conf in low_conf:
+            print(f"    Q{q_idx}[{ev_i}] conf={conf:.2f} | {snippet}...")
+
+    # ── 保存审计文件（不污染输出 JSON） ──
+    if out_dir and low_conf:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        audit_path = os.path.join(out_dir, f"evidence_audit_{ts}.txt")
+        with open(audit_path, "w", encoding="utf-8") as f:
+            f.write("Evidence 软校验审计报告\n")
+            f.write(f"共 {len(low_conf)}/{total_ev} 条置信度 < 0.5，建议人工核查\n")
+            f.write("=" * 50 + "\n\n")
+            for q_idx, ev_i, snippet, conf in low_conf:
+                f.write(f"Q{q_idx}[{ev_i}]  conf={conf:.2f}\n")
+                f.write(f"  Evidence: {snippet}\n\n")
+        print(f"  [Evidence] 审计报告: {audit_path}")
+
     return cleaned, per_q
 
 
@@ -815,7 +883,7 @@ def process_books(selected_names: list[str],
     per_q_evidence: dict[int, list[str]] = {}
     if ENABLE_EVIDENCE_VERIFICATION and answer.strip():
         print(f"  Verifying evidence from original text...")
-        evidence_text, per_q_evidence = _verify_evidence(answer, chunk_registry, question)
+        evidence_text, per_q_evidence = _verify_evidence(answer, chunk_registry, question, out_dir=out_dir)
 
     # 格式化最终输出：evidence 验证成功则用补充后的 JSON
     final_json = evidence_text if evidence_text and per_q_evidence else answer
