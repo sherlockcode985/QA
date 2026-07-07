@@ -311,6 +311,26 @@ def get_book_content(name: str) -> str:
         return f.read().strip()
 
 
+# 文件名全是数字 ID，书名在文本第一行
+# 少数文件第一行不是书名，需要用数字 ID 手动映射
+BOOK_TITLE_MAP = {
+    "75170": "The Sound and the Fury",
+    "45839": "Dracula",
+    "9603": "The Dream of the Red Chamber",
+    "62897": "The Arabian Nights",
+    "19860": "The Arabian Nights Entertainments",
+}
+
+
+def get_book_title(name: str) -> str:
+    book_id = name.replace(".cleaned.txt", "")
+    if book_id in BOOK_TITLE_MAP:
+        return BOOK_TITLE_MAP[book_id]
+    path = os.path.join(DATA_DIR, name)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.readline().strip()
+
+
 # ============ 三元组后处理 ============
 
 def _canonicalize_entities(triples: list[dict]) -> tuple[list[dict], dict[str, str]]:
@@ -565,8 +585,8 @@ def _parse_qa_pairs(answer: str) -> list[tuple[int, str, str]]:
 
 
 def _strip_section_refs(text: str) -> str:
-    """去掉答案中的 [Section N] 引用标记，仅用于显示。"""
-    return re.sub(r'\s*\[Section(?:s)?\s*(\d+(?:\s*[-–—,]\s*\d+)*(?:\s*,\s*\d+)*)\]', '', text).strip()
+    """去掉答案中的 [N] 引用标记，仅用于显示。"""
+    return re.sub(r'\s*\[(\d+)\]', '', text).strip()
 
 
 def _group_evidence_by_q(qa_array_str: str) -> dict[int, list[str]]:
@@ -613,23 +633,17 @@ def _verify_evidence(answer: str, chunk_registry: dict,
     except json.JSONDecodeError:
         return answer, {}
 
-    # 从 answer 字段或 response 字段中提取 section 引用
+    # 从 answer 字段或 response 字段中提取 [N] 引用
     def _get_ans(item: dict) -> str:
         return item.get("answer") or item.get("response") or ""
 
     cited: set[int] = set()
     for qa in qa_list:
         a_text = _get_ans(qa)
-        for m in re.finditer(r'\[Section(?:s)?\s*(\d+)(?:\s*[-–—]\s*(\d+))?\]', a_text, re.IGNORECASE):
-            start = int(m.group(1))
-            end = int(m.group(2)) if m.group(2) else start
-            for s in range(start, end + 1):
+        for m in re.finditer(r'\[(\d+)\]', a_text):
+            s = int(m.group(1))
+            if 1 <= s <= len(chunk_registry) * 2:
                 cited.add(s)
-        for m in re.finditer(r'\[Section(?:s)?\s+(\d+(?:\s*,\s*\d+)+)\]', a_text, re.IGNORECASE):
-            for token in re.split(r'\s*,\s*', m.group(1)):
-                s = int(token.strip())
-                if 1 <= s <= len(chunk_registry) * 2:
-                    cited.add(s)
 
     if not cited:
         return answer, {}
@@ -639,11 +653,8 @@ def _verify_evidence(answer: str, chunk_registry: dict,
     for sec in sorted(cited):
         if sec in chunk_registry:
             entry = chunk_registry[sec]
-            text_preview = entry["text"]
-            if len(text_preview) > 3000:
-                text_preview = text_preview[:1500] + "\n...[...]...\n" + text_preview[-1500:]
             cited_texts.append(
-                f"[Section {sec}] ({entry['book']}, chars {entry['start']}-{entry['end']})\n{text_preview}"
+                f"[{sec}] ({entry['book']}, chars {entry['start']}-{entry['end']})\n{entry['text']}"
             )
     if len(cited_texts) > max_sections:
         cited_texts = cited_texts[:max_sections]
@@ -749,10 +760,14 @@ def process_books(selected_names: list[str],
         f"[Section {i+1}]\n{s}" for i, s in enumerate(summaries)
     )
 
+    # 将真实书名（从文件第一行提取）显式传给 LLM
+    book_titles = {name: get_book_title(name) for name in selected_names}
+    book_context = f"Books: {', '.join(book_titles.values())}\n\n"
+
     if question:
-        user_content = f"Summaries:\n\n{summaries_text}\n\nQuestion: {question}"
+        user_content = book_context + f"Summaries:\n\n{summaries_text}\n\nQuestion: {question}"
     else:
-        user_content = f"Summaries:\n\n{summaries_text}"
+        user_content = book_context + f"Summaries:\n\n{summaries_text}"
 
     if triples_guide:
         user_content += f"\n\nReference Knowledge Graph triples (use these to guide your output):\n{triples_guide}"
@@ -804,15 +819,36 @@ def process_books(selected_names: list[str],
 
     # 格式化最终输出：evidence 验证成功则用补充后的 JSON
     final_json = evidence_text if evidence_text and per_q_evidence else answer
-    # 去掉 answer 中的 [Section N] 引用
+    # 去掉 answer 中的 [N] 引用，并确保每个 QA 项都有 evidence 字段
     try:
         parsed = json.loads(final_json)
         if isinstance(parsed, list):
             for item in parsed:
                 if "answer" in item:
                     item["answer"] = _strip_section_refs(item["answer"])
+                if "answer" in item and "evidence" not in item:
+                    item["evidence"] = []
+                if "book" in item:
+                    # LLM 可能输出文件名或真实书名，统一修正为 `book_titles` 中的值
+                    raw = item["book"]
+                    for fname, title in book_titles.items():
+                        if raw == title or raw in fname or fname.startswith(raw):
+                            item["book"] = title
+                            break
+                    else:
+                        item["book"] = raw
         elif isinstance(parsed, dict) and "answer" in parsed:
             parsed["answer"] = _strip_section_refs(parsed["answer"])
+            if "evidence" not in parsed:
+                parsed["evidence"] = []
+            if "book" in parsed:
+                raw = parsed["book"]
+                for fname, title in book_titles.items():
+                    if raw == title or raw in fname or fname.startswith(raw):
+                        parsed["book"] = title
+                        break
+                else:
+                    parsed["book"] = raw
         answer_with_evidence = json.dumps(parsed, ensure_ascii=False, indent=2)
     except json.JSONDecodeError:
         answer_with_evidence = final_json

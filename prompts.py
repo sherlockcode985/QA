@@ -288,18 +288,19 @@ canonical_name
 ANSWER_SYSTEM_PROMPT: str = (
     "You are given section summaries of one or more books. "
     "Answer based on ALL summaries.\n\n"
-    "CRITICAL — For EACH factual claim you make, cite its source section(s) in brackets, "
-    "like [Section 3] or [Sections 3-5]. "
+    "CRITICAL — For EACH factual claim you make, cite its source section number(s) in brackets, "
+    "like [3] or [4][5][6]. "
     "Every distinct fact (character introduction, event, relationship, plot point) must be "
     "attributed to a specific section.\n\n"
-    "If a claim spans multiple sections, list all of them: [Sections 3, 7, 12].\n"
+    "If a claim spans multiple sections, list each section number individually: [3][7][12].\n"
+    "Do NOT use range notation like [3-5]; write [3][4][5] instead.\n"
     "If the question has multiple sub-parts, organize your answer with clear "
     "paragraphs or bullet points, each with its own citations.\n\n"
     "Output format — a JSON object:\n"
     '{\n'
-    '    "book": "<book filename>",\n'
+    '    "book": "<book title>",\n'
     '    "question": "<the question>",\n'
-    '    "answer": "<your answer with [Section N] citations>"\n'
+    '    "answer": "<your answer with [N] citations>"\n'
     "}\n\n"
     "Return ONLY the JSON object, no other text."
 )
@@ -311,16 +312,17 @@ Each QA pair should test deep understanding of characters, relationships, events
 Requirements:
 - Questions should be diverse: some about characters, some about events, some about relationships.
 - Answers should be accurate and cite specific details from the summaries.
-- CRITICAL: For each factual claim in each answer, cite the source section(s) in brackets:
-  [Section 3] or [Sections 5-7]. Every distinct fact must have a citation.
+- CRITICAL: For each factual claim in each answer, cite the source section number(s) in brackets:
+  [3] or [5][6][7]. Every distinct fact must have a citation.
+  Do NOT use range notation like [5-7]; write [5][6][7] instead.
 - Avoid yes/no questions; prefer open-ended questions requiring reasoning.
 
 Output format — a JSON array of objects:
 [
     {
-        "book": "<book filename>",
+        "book": "<book title>",
         "question": "<question>",
-        "answer": "<answer with [Section N] citations>"
+        "answer": "<answer with [N] citations>"
     },
     ...
 ]
@@ -337,7 +339,7 @@ You will receive:
 2. A QA ARRAY — JSON array of {book, question, answer} objects
 
 For EACH QA pair's answer:
-1. Read the factual claims and their [Section N] citations
+1. Read the factual claims and their [N] citations
 2. Find VERBATIM (exact, word-for-word) quotes from the corresponding original text sections that support each claim
 3. Add the evidence to that QA object
 
