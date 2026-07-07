@@ -734,10 +734,14 @@ def _verify_evidence(answer: str, chunk_registry: dict,
                 snippet = ev_text[:80].replace('\n', ' ')
                 low_conf.append((q_idx, ev_i, snippet, conf))
 
+    good = total_ev - len(low_conf)
+    print(f"  [Evidence] 软校验: {good}/{total_ev} 条正常", end="")
     if low_conf:
-        print(f"  [Evidence] 软校验: {len(low_conf)}/{total_ev} 条置信度偏低 (<0.5):")
+        print(f", {len(low_conf)} 条偏低 (<0.5):")
         for q_idx, ev_i, snippet, conf in low_conf:
             print(f"    Q{q_idx}[{ev_i}] conf={conf:.2f} | {snippet}...")
+    else:
+        print()
 
     # ── 保存审计文件（不污染输出 JSON） ──
     if out_dir and low_conf:
