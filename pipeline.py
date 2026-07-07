@@ -1051,10 +1051,16 @@ def interactive():
     out_dir = os.path.join(os.path.dirname(__file__), "output")
     os.makedirs(out_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(out_dir, f"result_{ts}.txt")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"{result['answer_with_evidence']}\n\n")
-        f.write(f"--- Stats ---\n")
+
+    # 纯 JSON 数据，供训练使用
+    json_path = os.path.join(out_dir, f"result_{ts}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        f.write(result['answer_with_evidence'].strip() + "\n")
+    print(f"\nJSON saved: {json_path}")
+
+    # 日志文件，供人工查阅
+    log_path = os.path.join(out_dir, f"result_{ts}.log")
+    with open(log_path, "w", encoding="utf-8") as f:
         f.write(f"Workers: {WORKERS}\n")
         f.write(f"Windows: {result['total_windows']}\n")
         f.write(f"Total time: {result['total_time']:.0f}s\n")
@@ -1063,7 +1069,7 @@ def interactive():
             f.write(f"Triples CSV: {result['triples_csv']}\n")
         if result.get('registry_path'):
             f.write(f"Chunk Registry: {result['registry_path']}\n")
-    print(f"\nSaved: {out_path}")
+    print(f"Log saved: {log_path}")
     if result.get('triples_csv'):
         print(f"Triples CSV: {result['triples_csv']}")
 
