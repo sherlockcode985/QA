@@ -73,7 +73,7 @@ Output format — a JSON array:
 
 Return ONLY the JSON array, no other text.""",
         "temperature": 0.3,
-        "num_questions": "3-5",
+        "num_questions": "4",
     },
 
     # ── 剧情时序 ────────────────────────────────────────────────
@@ -120,7 +120,7 @@ Output format — a JSON array:
 
 Return ONLY the JSON array, no other text.""",
         "temperature": 0.2,
-        "num_questions": "3-5",
+        "num_questions": "4",
     },
 
     # ── 细节定位 ────────────────────────────────────────────────

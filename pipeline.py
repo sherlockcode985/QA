@@ -317,14 +317,22 @@ def get_book_content(name: str) -> str:
         return f.read().strip()
 
 
-# 文件名全是数字 ID，书名在文本第一行
-# 少数文件第一行不是书名，需要用数字 ID 手动映射
+# 书名修正映射表
+# 部分 .cleaned.txt 文件的第一行不是书名（如版权声明、作者名等），
+# 需要手动映射到正确书名。仅收录有偏差的文件。
 BOOK_TITLE_MAP = {
-    "75170": "The Sound and the Fury",
-    "45839": "Dracula",
-    "9603": "The Dream of the Red Chamber",
-    "62897": "The Arabian Nights",
-    "19860": "The Arabian Nights Entertainments",
+    # 文件名（不含 .cleaned.txt）→ 正确书名
+    # 仅收录第一行不是书名的文件
+    "Dracula": "Dracula",
+    "Dream of the Red Chamber": "Dream of the Red Chamber",
+    "Frankenstein": "Frankenstein",
+    "LES MISÉRABLES": "LES MISÉRABLES",
+    "MOBY-DICK; or, THE WHALE": "MOBY-DICK; or, THE WHALE",
+    "The Arabian Nights Entertainments": "The Arabian Nights Entertainments",
+    "The Arabian Nights": "The Arabian Nights",
+    "The Faerie Queene": "The Faerie Queene",
+    "The Great Gatsby": "The Great Gatsby",
+    "The Sound and the Fury": "The Sound and the Fury",
 }
 
 
@@ -811,6 +819,13 @@ def process_books(selected_names: list[str],
         if question_type:
             print(f"  Using type-specific summary & QA prompts.")
 
+    # num_questions 约束单本书的输出数量，注入 QA prompt
+    if override_prompts:
+        num_questions = override_prompts.get("num_questions", "3-5")
+    else:
+        num_questions = type_cfg.get("num_questions", "3-5")
+    qa_prompt = qa_prompt.replace("3-5", num_questions, 1)
+
     book_titles = {name: get_book_title(name) for name in selected_names}
 
     if question:
@@ -870,7 +885,6 @@ def process_books(selected_names: list[str],
         all_triples_collected = []
         chunk_registry: dict[int, dict] = {}
         grand_idx = 0
-
         for book_name in selected_names:
             print(f"\n  --- {book_name} ---")
             content = get_book_content(book_name)
@@ -925,6 +939,15 @@ def process_books(selected_names: list[str],
                 else:
                     all_qa_pairs.append(parsed)
                 print(f"  -> {len(parsed) if isinstance(parsed, list) else 1} QA pairs generated")
+
+                # 保存单本书的 JSON
+                qa_items = parsed if isinstance(parsed, list) else [parsed]
+                book_ts = time.strftime("%Y%m%d_%H%M%S")
+                book_safe = book_name.replace(".cleaned.txt", "").replace(" ", "_")
+                book_path = os.path.join(out_dir, f"result_{book_safe}_{book_ts}.json")
+                with open(book_path, "w", encoding="utf-8") as f:
+                    json.dump(qa_items, f, ensure_ascii=False, indent=2)
+                print(f"  -> Saved: {os.path.basename(book_path)}")
             except json.JSONDecodeError as e:
                 print(f"  [Warning] {book_name}: QA result parsing failed ({e}), skipped.")
 
