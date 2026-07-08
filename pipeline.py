@@ -43,6 +43,7 @@ from prompts import (
     QA_GENERATION_PROMPT,
     EVIDENCE_VERIFICATION_PROMPT,
 )
+from question_types import get_type_config, list_types
 
 client = OpenAI(base_url=API_BASE, api_key=API_KEY, timeout=600.0)
 
@@ -138,10 +139,12 @@ def _parse_verdict(text: str) -> tuple[bool, str]:
 # ============ 对抗式窗口总结 ============
 
 def _summarize_chunk(window_text: str, book_name: str,
-                     idx: int, total: int) -> str:
+                     idx: int, total: int,
+                     system_prompt: str | None = None) -> str:
     """Step 1: 总结者 —— 只做章节概括，不抽取三元组"""
+    prompt = system_prompt if system_prompt else SUMMARIZE_CHUNK_PROMPT
     msgs = [
-        {"role": "system", "content": SUMMARIZE_CHUNK_PROMPT},
+        {"role": "system", "content": prompt},
         {"role": "user", "content": f"[{book_name} | {idx}/{total}]\n{window_text}"},
     ]
     r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
@@ -187,14 +190,15 @@ def _revise_triples(summary: str, window_text: str,
 
 
 def summarize_one_adversarial(window_text: str, book_name: str,
-                              idx: int, total: int) -> tuple[str, list[tuple[str, str, str]]]:
+                              idx: int, total: int,
+                              summary_prompt: str | None = None) -> tuple[str, list[tuple[str, str, str]]]:
     """对抗式多步总结：总结 → 抽取 → 校验 → 修正（最多 MAX_ITERATIONS 轮）
     线程安全，返回 (summary, [(subject, predicate, object), ...])
     当 ENABLE_TRIPLE_EXTRACTION=False 时跳过三元组相关步骤。"""
     for attempt in range(MAX_RETRIES + 1):
         try:
             # Step 1: 总结
-            summary = _summarize_chunk(window_text, book_name, idx, total)
+            summary = _summarize_chunk(window_text, book_name, idx, total, system_prompt=summary_prompt)
 
             # 三元组抽取开关
             triples: list[tuple[str, str, str]] = []
@@ -223,7 +227,8 @@ def summarize_one_adversarial(window_text: str, book_name: str,
 
 
 def summarize_all_parallel(tasks: list[dict], workers: int = WORKERS,
-                           resume_path: str | None = None) -> tuple[list[tuple[int, str]], list[dict]]:
+                           resume_path: str | None = None,
+                           summary_prompt: str | None = None) -> tuple[list[tuple[int, str]], list[dict]]:
     """
     tasks: [{global_idx, book_name, text, section_idx, section_total}]
     返回 ([(global_idx, summary)], [triple_dicts])，summary 已按 global_idx 排序。
@@ -246,7 +251,8 @@ def summarize_all_parallel(tasks: list[dict], workers: int = WORKERS,
     def process(t: dict) -> tuple[int, str, list[tuple[str, str, str]]]:
         idx = t["global_idx"]
         summary, triples = summarize_one_adversarial(t["text"], t["book_name"],
-                                                       t["section_idx"], t["section_total"])
+                                                       t["section_idx"], t["section_total"],
+                                                       summary_prompt=summary_prompt)
         with lock:
             done.add(idx)
             results[idx] = summary
@@ -781,85 +787,153 @@ def _save_triples_csv(triples: list[dict]) -> str:
 def process_books(selected_names: list[str],
                   question: str | None = None,
                   triples_guide: str | None = None,
-                  resume_path: str | None = None) -> dict:
+                  resume_path: str | None = None,
+                  question_type: str | None = None,
+                  override_prompts: dict | None = None) -> dict:
     t_start = time.time()
     all_tasks = []
     total_windows = 0
     out_dir = os.path.join(os.path.dirname(__file__), "output")
     os.makedirs(out_dir, exist_ok=True)
 
-    for name in selected_names:
-        content = get_book_content(name)
-        windows = sliding_window_chunks(content)
-        section_total = len(windows)
-        for i, w in enumerate(windows, 1):
-            all_tasks.append({
-                "global_idx": total_windows + i,
-                "book_name": name,
-                "section_idx": i,
-                "section_total": section_total,
-                "text": w["text"],
-                "start": w["start"],
-                "end": w["end"],
-            })
-        total_windows += section_total
-        print(f"  [{name}] {section_total} windows")
-
-    # 构建 Chunk Registry：section_idx → {book, start, end, text}
-    chunk_registry: dict[int, dict] = {}
-    for t in all_tasks:
-        chunk_registry[t["global_idx"]] = {
-            "book": t["book_name"],
-            "section_within_book": t["section_idx"],
-            "start": t.get("start", 0),
-            "end": t.get("end", 0),
-            "text": t["text"],
-        }
-
-    # 并行总结
-    sorted_results, all_triples = summarize_all_parallel(all_tasks, WORKERS, resume_path)
-
-    summaries = [s for _, s in sorted_results]
-
-    # 三元组后处理
-    if all_triples:
-        all_triples = _post_process_triples(all_triples)
-
-    # 最终回答 / QA 生成
-    print(f"\n  All {len(summaries)} windows summarized ({len(all_triples)} triples after post-processing).")
-
-    summaries_text = "\n\n".join(
-        f"[Section {i+1}]\n{s}" for i, s in enumerate(summaries)
-    )
-
-    # 将真实书名（从文件第一行提取）显式传给 LLM
-    book_titles = {name: get_book_title(name) for name in selected_names}
-    book_context = f"Books: {', '.join(book_titles.values())}\n\n"
-
-    if question:
-        user_content = book_context + f"Summaries:\n\n{summaries_text}\n\nQuestion: {question}"
+    # 题型配置（override_prompts 优先，用于 notebook 调试时不改 question_types.py）
+    if override_prompts:
+        summary_prompt = override_prompts.get("summary_prompt", SUMMARIZE_CHUNK_PROMPT)
+        qa_prompt = override_prompts.get("qa_prompt", QA_GENERATION_PROMPT)
+        type_label = override_prompts.get("label", "custom")
+        print(f"  Using override prompts ({type_label}).")
     else:
-        user_content = book_context + f"Summaries:\n\n{summaries_text}"
+        type_cfg = get_type_config(question_type) if question_type else get_type_config("default")
+        summary_prompt = type_cfg["summary_prompt"]
+        qa_prompt = type_cfg["qa_prompt"]
+        type_label = type_cfg['label']
+        print(f"  Question type: {type_label}")
+        if question_type:
+            print(f"  Using type-specific summary & QA prompts.")
 
-    if triples_guide:
-        user_content += f"\n\nReference Knowledge Graph triples (use these to guide your output):\n{triples_guide}"
+    book_titles = {name: get_book_title(name) for name in selected_names}
 
     if question:
+        # ── 手动提问：跨所有书处理（原逻辑不变）──
+        for name in selected_names:
+            content = get_book_content(name)
+            windows = sliding_window_chunks(content)
+            section_total = len(windows)
+            for i, w in enumerate(windows, 1):
+                all_tasks.append({
+                    "global_idx": total_windows + i,
+                    "book_name": name,
+                    "section_idx": i,
+                    "section_total": section_total,
+                    "text": w["text"],
+                    "start": w["start"],
+                    "end": w["end"],
+                })
+            total_windows += section_total
+            print(f"  [{name}] {section_total} windows")
+
+        chunk_registry: dict[int, dict] = {}
+        for t in all_tasks:
+            chunk_registry[t["global_idx"]] = {
+                "book": t["book_name"],
+                "section_within_book": t["section_idx"],
+                "start": t.get("start", 0),
+                "end": t.get("end", 0),
+                "text": t["text"],
+            }
+
+        sorted_results, all_triples = summarize_all_parallel(all_tasks, WORKERS, resume_path, summary_prompt=summary_prompt)
+        summaries = [s for _, s in sorted_results]
+        if all_triples:
+            all_triples = _post_process_triples(all_triples)
+        print(f"\n  All {len(summaries)} windows summarized ({len(all_triples)} triples after post-processing).")
+
+        summaries_text = "\n\n".join(
+            f"[Section {i+1}]\n{s}" for i, s in enumerate(summaries)
+        )
+        book_context = f"Books: {', '.join(book_titles.values())}\n\n"
+        user_content = book_context + f"Summaries:\n\n{summaries_text}\n\nQuestion: {question}"
+        if triples_guide:
+            user_content += f"\n\nReference Knowledge Graph triples (use these to guide your output):\n{triples_guide}"
         print(f"  Generating final answer...\n")
         answer_messages = [
             {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ]
+        t0 = time.time()
+        answer = _strip_code_fence(_call_model(answer_messages, MAX_TOKENS_ANSWER))
+        answer_time = time.time() - t0
+        all_triples_collected = all_triples
     else:
-        print(f"  Generating QA pairs from summaries...\n")
-        answer_messages = [
-            {"role": "system", "content": QA_GENERATION_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
+        # ── 自动出题：逐本书串行处理，互不干扰 ──
+        all_qa_pairs: list[dict] = []
+        all_triples_collected = []
+        chunk_registry: dict[int, dict] = {}
+        grand_idx = 0
 
-    t0 = time.time()
-    answer = _strip_code_fence(_call_model(answer_messages, MAX_TOKENS_ANSWER))
-    answer_time = time.time() - t0
+        for book_name in selected_names:
+            print(f"\n  --- {book_name} ---")
+            content = get_book_content(book_name)
+            windows = sliding_window_chunks(content)
+            section_total = len(windows)
+
+            tasks = []
+            for i, w in enumerate(windows, 1):
+                grand_idx += 1
+                tasks.append({
+                    "global_idx": grand_idx,
+                    "book_name": book_name,
+                    "section_idx": i,
+                    "section_total": section_total,
+                    "text": w["text"],
+                    "start": w["start"],
+                    "end": w["end"],
+                })
+                chunk_registry[grand_idx] = {
+                    "book": book_name,
+                    "section_within_book": i,
+                    "start": w.get("start", 0),
+                    "end": w.get("end", 0),
+                    "text": w["text"],
+                }
+
+            total_windows += section_total
+            print(f"  [{book_name}] {section_total} windows")
+
+            # 总结（单本书内多窗口并行）
+            sorted_results, triples = summarize_all_parallel(tasks, WORKERS, resume_path, summary_prompt=summary_prompt)
+            all_triples_collected.extend(triples)
+
+            # 单本书生成 QA
+            summaries_text = "\n\n".join(
+                f"[Section {idx}]\n{s}" for idx, s in sorted_results
+            )
+            book_title = book_titles.get(book_name, book_name)
+            user_content = f"Book: {book_title}\n\nSummaries:\n\n{summaries_text}"
+            if triples_guide:
+                user_content += f"\n\nReference Knowledge Graph triples:\n{triples_guide}"
+
+            msgs = [
+                {"role": "system", "content": qa_prompt},
+                {"role": "user", "content": user_content},
+            ]
+            book_result = _strip_code_fence(_call_model(msgs, MAX_TOKENS_ANSWER))
+            try:
+                parsed = json.loads(book_result)
+                if isinstance(parsed, list):
+                    all_qa_pairs.extend(parsed)
+                else:
+                    all_qa_pairs.append(parsed)
+                print(f"  -> {len(parsed) if isinstance(parsed, list) else 1} QA pairs generated")
+            except json.JSONDecodeError as e:
+                print(f"  [Warning] {book_name}: QA result parsing failed ({e}), skipped.")
+
+        all_triples = _post_process_triples(all_triples_collected) if all_triples_collected else []
+        print(f"\n  All {total_windows} windows summarized ({len(all_triples)} triples after post-processing).")
+
+        answer = json.dumps(all_qa_pairs, ensure_ascii=False, indent=2) if all_qa_pairs else "[]"
+        answer_time = time.time() - t_start
+        # answer_time 在自动出题模式下=总耗时，手动提问模式下=单次 LLM 调用耗时
 
     # 保存三元组 CSV
     csv_path = None
@@ -925,6 +999,14 @@ def process_books(selected_names: list[str],
     except json.JSONDecodeError:
         answer_with_evidence = final_json
 
+    # 保存最终 JSON 到 output/
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    suffix = type_label.replace(" ", "_")
+    result_path = os.path.join(out_dir, f"result_{suffix}_{ts}.json")
+    with open(result_path, "w", encoding="utf-8") as f:
+        f.write(answer_with_evidence.strip() + "\n")
+    print(f"  Result saved: {result_path}")
+
     # 清理进度文件
     if resume_path and os.path.exists(resume_path):
         os.remove(resume_path)
@@ -963,39 +1045,65 @@ def interactive():
 
     books = load_books()
     print(f"\n{len(books)} books available.")
-    print_books_table()
 
-    # ── 选择书籍（保留原有逻辑） ──
-    print("\nSelect books (indices like 0,1,2 or range 0-5 or 'all'):")
-    while True:
-        try:
-            choice = input(">>> ").strip()
-        except EOFError:
-            choice = "all"
-        if not choice:
-            continue
-        if choice.lower() == "all":
-            selected = [b["name"] for b in books]
-            break
-        indices = []
-        for token in re.split(r"[,，]", choice):
-            token = token.strip()
-            m = re.match(r"(\d+)\s*-\s*(\d+)", token)
-            if m:
-                indices.extend(range(int(m.group(1)), int(m.group(2)) + 1))
-            elif token.isdigit():
-                indices.append(int(token))
-        indices = sorted(set(i for i in indices if 0 <= i < len(books)))
-        if indices:
-            selected = [books[i]["name"] for i in indices]
-            break
-        print(f"Invalid. Enter 0-{len(books)-1}.")
+    # ── 题型选择（先选，自动加载该题型配置的书） ──
+    print(f"\nSelect question type:")
+    type_keys = list_types()
+    for i, (key, label) in enumerate(type_keys):
+        print(f"  {i}. {label} ({key})")
+    print(f"  (press Enter for 'default')")
+    qt_choice = input(">>> ").strip()
+    if qt_choice.isdigit() and 0 <= int(qt_choice) < len(type_keys):
+        question_type = type_keys[int(qt_choice)][0]
+    elif qt_choice == "":
+        question_type = "default"
+    else:
+        question_type = "default"
+    type_cfg = get_type_config(question_type)
+    print(f"  Selected: {type_cfg['label']}")
+
+    # ── 自动加载该题型配置的书 ──
+    type_books = type_cfg.get("books")
+    if type_books is not None:
+        # 过滤出实际存在的书
+        available = [b["name"] for b in books]
+        selected = [b for b in type_books if b in available]
+        if not selected:
+            print(f"  Warning: no configured books found for this type. Falling back to manual selection.")
+            type_books = None
+
+    if type_books is None:
+        # default 或配置的书不存在时，手动选书
+        print_books_table()
+        print("\nSelect books (indices like 0,1,2 or range 0-5 or 'all'):")
+        while True:
+            try:
+                choice = input(">>> ").strip()
+            except EOFError:
+                choice = "all"
+            if not choice:
+                continue
+            if choice.lower() == "all":
+                selected = [b["name"] for b in books]
+                break
+            indices = []
+            for token in re.split(r"[,，]", choice):
+                token = token.strip()
+                m = re.match(r"(\d+)\s*-\s*(\d+)", token)
+                if m:
+                    indices.extend(range(int(m.group(1)), int(m.group(2)) + 1))
+                elif token.isdigit():
+                    indices.append(int(token))
+            indices = sorted(set(i for i in indices if 0 <= i < len(books)))
+            if indices:
+                selected = [books[i]["name"] for i in indices]
+                break
+            print(f"Invalid. Enter 0-{len(books)-1}.")
+    else:
+        print(f"  Books: {', '.join(selected)}")
 
     tw = sum(b["windows"] for b in books if b["name"] in selected)
-    est_serial = tw * 35
-    est_parallel = est_serial // WORKERS
-    print(f"\nSelected {len(selected)} book(s), ~{tw} windows.")
-    print(f"Workers: {WORKERS}, estimated: ~{est_parallel // 60} min")
+    print(f"  Windows: ~{tw} | Workers: {WORKERS} | Estimated: ~{tw * 35 // WORKERS // 60} min")
 
     # ── 问题输入（可通过 prompts.py 中 ENABLE_QUESTION_INPUT 开关控制） ──
     question: str | None = None
@@ -1034,33 +1142,28 @@ def interactive():
 
     result = process_books(selected, question=question,
                            triples_guide=triples_guide,
-                           resume_path=None)
+                           resume_path=None,
+                           question_type=question_type)
 
     # ── 输出结果 ──
     print(f"\n{'='*60}")
     if question:
         print(f"Q: {question}")
     else:
-        print("Auto-generated QA Pairs:")
+        type_label = type_cfg['label']
+        print(f"Auto-generated QA Pairs ({type_label}):")
     print(f"{'='*60}\n")
     print(result["answer_with_evidence"])
     print(f"\n{'='*60}")
     print(f"Time: {result['total_time']:.0f}s | Windows: {result['total_windows']} | Triples: {result.get('triples_count', 0)}")
 
-    # ── 保存结果 ──
+    # 日志文件，供人工查阅
     out_dir = os.path.join(os.path.dirname(__file__), "output")
     os.makedirs(out_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-
-    # 纯 JSON 数据，供训练使用
-    json_path = os.path.join(out_dir, f"result_{ts}.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        f.write(result['answer_with_evidence'].strip() + "\n")
-    print(f"\nJSON saved: {json_path}")
-
-    # 日志文件，供人工查阅
     log_path = os.path.join(out_dir, f"result_{ts}.log")
     with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"Question type: {type_cfg['label']}\n")
         f.write(f"Workers: {WORKERS}\n")
         f.write(f"Windows: {result['total_windows']}\n")
         f.write(f"Total time: {result['total_time']:.0f}s\n")
