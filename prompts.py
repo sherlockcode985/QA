@@ -125,7 +125,6 @@ Pay special attention to name variations: if a character is called by different 
 
 Output ONLY the summary text. Do NOT extract triples or add any other sections."""
 
-
 # ============ Step 2: 抽取者提示词 ============
 
 # {triple_instruction} 会被替换为上方 TRIPLE_INSTRUCTION
