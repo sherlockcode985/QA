@@ -634,6 +634,32 @@ def _strip_code_fence(text: str) -> str:
     return s.strip()
 
 
+def _repair_json(text: str) -> str:
+    """尝试修复 LLM 输出的常见 JSON 格式错误。"""
+    # 尝试直接解析
+    text = text.strip()
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        pass
+    # 尝试从文本中提取 [...] 数组
+    m = re.search(r'\[.*\]', text, re.DOTALL)
+    if m:
+        candidate = m.group()
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            text = candidate
+    # 尝试修复: 对象之间缺逗号 } { → }, {
+    text = re.sub(r'\}\s*\{', '},{', text)
+    # 尝试修复: 数组内最后一个元素后多了逗号 ], }
+    text = re.sub(r',\s*\]', ']', text)
+    text = re.sub(r',\s*\}', '}', text)
+    return text
+
+
 def _parse_qa_pairs(answer: str) -> list[tuple[int, str, str]]:
     """从 JSON 格式的 QA 数组中解析单个 Q/A 对。
     返回 [(index, question_text, answer_text), ...]"""
@@ -684,7 +710,7 @@ def _verify_evidence(answer: str, chunk_registry: dict,
     answer 应为 JSON 数组/对象，answer/response 字段含 [Section N] 引用。
     返回 (json_string_with_evidence, per_q_evidence)
     """
-    # 1. 解析 JSON，收集所有 [Section N] 引用
+    # 1. 解析 JSON
     try:
         qa_list = json.loads(answer)
         if not isinstance(qa_list, list):
@@ -692,92 +718,80 @@ def _verify_evidence(answer: str, chunk_registry: dict,
     except json.JSONDecodeError:
         return answer, {}
 
-    # 从 answer 字段或 response 字段中提取 [N] 引用
     def _get_ans(item: dict) -> str:
         return item.get("answer") or item.get("response") or ""
 
-    cited: set[int] = set()
-    for qa in qa_list:
+    per_q_evidence: dict[int, list[str]] = {}
+    total_ev = 0
+    low_conf: list[tuple[int, int, str, float]] = []
+
+    # 2. 逐 QA 处理（每个 QA 只搜自己的 cited sections）
+    for i, qa in enumerate(qa_list):
         a_text = _normalize_citations(_get_ans(qa))
+
+        cited = set()
         for m in re.finditer(r'\[(\d+)\]', a_text):
             s = int(m.group(1))
             if 1 <= s <= len(chunk_registry):
                 cited.add(s)
 
-    if not cited:
-        return answer, {}
-
-    # 2. 取出被引用 section 的原文
-    cited_texts = []
-    for sec in sorted(cited):
-        if sec in chunk_registry:
-            entry = chunk_registry[sec]
-            cited_texts.append(
-                f"[{sec}] ({entry['book']}, chars {entry['start']}-{entry['end']})\n{entry['text']}"
-            )
-    if len(cited_texts) > max_sections:
-        cited_texts = cited_texts[:max_sections]
-        cited_texts.append("... (余下 cited sections 省略)")
-
-    if not cited_texts:
-        return answer, {}
-
-    cited_sections_text = "\n\n---\n\n".join(cited_texts)
-
-    # 3. 调用 LLM 获取 evidence（输出简单行格式，无 JSON 转义问题）
-    msgs = [
-        {"role": "system", "content": EVIDENCE_VERIFICATION_PROMPT},
-        {"role": "user", "content": (
-            f"CITED SECTIONS (original text):\n{cited_sections_text}\n\n"
-            f"QA ARRAY:\n{json.dumps(qa_list, ensure_ascii=False, indent=2)}"
-        )},
-    ]
-
-    try:
-        result_text = _call_model(msgs, MAX_TOKENS_ANSWER)
-        cleaned = _strip_code_fence(result_text)
-    except Exception as e:
-        print(f"  [Evidence] 调用失败: {e}")
-        return answer, {}
-
-    # 4. 解析行格式：idx || evidence_text
-    per_q_evidence: dict[int, list[str]] = {}
-    for line in cleaned.strip().split("\n"):
-        line = line.strip()
-        if not line or " || " not in line:
+        if not cited:
             continue
-        idx_str, ev_text = line.split(" || ", 1)
+
+        cited_texts = []
+        for sec in sorted(cited):
+            entry = chunk_registry.get(sec)
+            if entry:
+                cited_texts.append(
+                    f"[{sec}] ({entry['book']}, chars {entry['start']}-{entry['end']})\n{entry['text']}"
+                )
+        if len(cited_texts) > max_sections:
+            cited_texts = cited_texts[:max_sections]
+            cited_texts.append("... (余下 cited sections 省略)")
+
+        if not cited_texts:
+            continue
+
+        cited_sections_text = "\n\n---\n\n".join(cited_texts)
+
+        msgs = [
+            {"role": "system", "content": EVIDENCE_VERIFICATION_PROMPT},
+            {"role": "user", "content": (
+                f"CITED SECTIONS (original text):\n{cited_sections_text}\n\n"
+                f"QA:\n{json.dumps(qa, ensure_ascii=False, indent=2)}"
+            )},
+        ]
+
         try:
-            idx = int(idx_str.strip())
-        except ValueError:
+            result_text = _call_model(msgs, MAX_TOKENS_ANSWER)
+            cleaned = _strip_code_fence(result_text)
+        except Exception as e:
+            print(f"  [Evidence] Q{i} 调用失败: {e}")
             continue
-        ev = ev_text.strip()
-        if ev:
-            per_q_evidence.setdefault(idx, []).append(ev)
 
-    total_ev = sum(len(v) for v in per_q_evidence.values())
+        ev_lines = [line.strip() for line in cleaned.strip().split("\n") if line.strip()]
+        if ev_lines:
+            per_q_evidence[i] = ev_lines
+            total_ev += len(ev_lines)
+
+            combined_src = "\n".join(
+                re.sub(r'\[(\d+)\] \(.*?\)\n', '', s) for s in cited_texts
+            )
+            for ev_i, ev_text in enumerate(ev_lines):
+                conf = _evidence_confidence(ev_text, combined_src)
+                if conf < 0.5:
+                    snippet = ev_text[:80].replace('\n', ' ')
+                    low_conf.append((i, ev_i, snippet, conf))
+
     print(f"  [Evidence] 验证完成, {total_ev} 条证据")
 
-    # 5. 程序化合并 evidence 到原 JSON，无转义风险
+    # 3. 合并 evidence 到原 JSON
     enriched = []
     for i, item in enumerate(qa_list):
         new_item = dict(item)
         new_item["evidence"] = per_q_evidence.get(i, [])
         enriched.append(new_item)
     enriched_json = json.dumps(enriched, ensure_ascii=False, indent=2)
-
-    # ── 软校验：检查每条 evidence 在原文中是否有匹配 ──
-    low_conf: list[tuple[int, int, str, float]] = []  # (qa_idx, ev_idx, snippet, score)
-    combined_src = "\n".join(
-        re.sub(r'\[(\d+)\] \(.*?\)\n', '', s)
-        for s in cited_texts
-    )
-    for q_idx, ev_list in per_q_evidence.items():
-        for ev_i, ev_text in enumerate(ev_list):
-            conf = _evidence_confidence(ev_text, combined_src)
-            if conf < 0.5:
-                snippet = ev_text[:80].replace('\n', ' ')
-                low_conf.append((q_idx, ev_i, snippet, conf))
 
     good = total_ev - len(low_conf)
     print(f"  [Evidence] 软校验: {good}/{total_ev} 条正常", end="")
@@ -788,7 +802,6 @@ def _verify_evidence(answer: str, chunk_registry: dict,
     else:
         print()
 
-    # ── 保存审计文件（不污染输出 JSON） ──
     if out_dir and low_conf:
         ts = time.strftime("%Y%m%d_%H%M%S")
         audit_path = os.path.join(out_dir, f"evidence_audit_{ts}.txt")
@@ -966,6 +979,7 @@ def process_books(selected_names: list[str],
                 {"role": "user", "content": user_content},
             ]
             book_result = _strip_code_fence(_call_model(msgs, MAX_TOKENS_ANSWER))
+            book_result = _repair_json(book_result)
             try:
                 parsed = json.loads(book_result)
                 if isinstance(parsed, list):

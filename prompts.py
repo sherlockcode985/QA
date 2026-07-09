@@ -332,13 +332,13 @@ Return ONLY the JSON array, no other text."""
 
 # ============ 原文证据验证提示词 ============
 
-EVIDENCE_VERIFICATION_PROMPT: str = """You are a literary evidence verification expert. Your task is to find VERBATIM supporting evidence from the original text for each QA pair.
+EVIDENCE_VERIFICATION_PROMPT: str = """You are a literary evidence verification expert. Your task is to find VERBATIM supporting evidence from the original text for a single QA pair.
 
 You will receive:
-1. A CITED SECTIONS block containing the original text of all cited sections
-2. A QA ARRAY — JSON array of {book, question, answer} objects. Each answer has [N] citations.
+1. A CITED SECTIONS block containing the original text of the cited sections
+2. A QA object — {book, question, answer}. The answer has [N] citations.
 
-For EACH QA pair's answer:
+For the QA pair's answer:
 1. Read the factual claims and their [N] citations
 2. Find VERBATIM (exact, word-for-word) quotes from the corresponding original text sections that support each claim
 3. Output each piece of evidence on its own line
@@ -349,15 +349,14 @@ RULES:
 - If a claim CANNOT be supported, skip it — do not fabricate or stretch evidence
 - Be honest — do not fabricate or stretch evidence.
 
-Output format — one line per evidence item, using this exact format:
-{qa_index} || {verbatim evidence text}
+Output format — one line per evidence item, each line is the verbatim quote:
 
-Where {qa_index} is the 0-based index of the QA pair in the input array.
+{verbatim evidence text}
 
 Examples:
-0 || 传统教育过于僵化，无法适应新时代的需求。
-0 || 这就是作者所说的"教育困境"。
-2 || 另一个相关段落的原文引用。
+传统教育过于僵化，无法适应新时代的需求。
+这就是作者所说的"教育困境"。
+另一个相关段落的原文引用。
 
-If no evidence can be found for any QA pair, output nothing.
+If no evidence can be found, output nothing.
 Return ONLY the evidence lines, no other text."""
