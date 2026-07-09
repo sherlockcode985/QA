@@ -58,18 +58,24 @@ def sliding_window_chunks(text: str, window_size: int = WINDOW_SIZE,
     start = 0
     total = len(text)
     while start < total:
-        # 非首块：对齐到词边界（跳过开头被截断的半截词）
+        # 非首块：对齐到下一句句首
         if chunks:
-            look = text[start:min(start + 80, total)]
-            m = re.search(r'\s', look)
+            look = text[start:min(start + 200, total)]
+            # 找到句末标点 + 空白，跳到下一句开头
+            m = re.search(r'[.!?。！？…]["\'"」』]?\s+', look)
             if m:
-                start += m.start() + 1
+                start += m.end()
+            else:
+                # fallback：至少对齐到词边界
+                m2 = re.search(r'\s', look)
+                if m2:
+                    start += m2.start() + 1
 
         end = min(start + window_size, total)
         if end < total:
             search_from = max(start, end - 200)
             last_break = -1
-            for m in re.finditer(r'[.!?。！？…]', text[search_from:end]):
+            for m in re.finditer(r'[.!?。！？…]["\'"」』]?', text[search_from:end]):
                 last_break = search_from + m.end()
             if last_break > start:
                 end = last_break
