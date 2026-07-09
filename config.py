@@ -9,7 +9,7 @@ import os
 # ============ API 配置 ============
 API_BASE = "https://api.v3.cm/v1"
 API_KEY = os.environ.get("API_KEY", "sk-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
-MODEL = "gpt-5.1"
+MODEL = "gemini-2.5-pro"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
 # ============ 滑动窗口 ============

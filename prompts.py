@@ -292,7 +292,7 @@ ANSWER_SYSTEM_PROMPT: str = (
     "Every distinct fact (character introduction, event, relationship, plot point) must be "
     "attributed to a specific section.\n\n"
     "If a claim spans multiple sections, list each section number individually: [3][7][12].\n"
-    "Do NOT use range notation like [3-5]; write [3][4][5] instead.\n"
+    "Do NOT use range notation like [3-5] or comma notation like [3, 4, 5]; write [3][4][5] instead.\n"
     "If the question has multiple sub-parts, organize your answer with clear "
     "paragraphs or bullet points, each with its own citations.\n\n"
     "Output format — a JSON object:\n"
@@ -313,7 +313,8 @@ Requirements:
 - Answers should be accurate and cite specific details from the summaries.
 - CRITICAL: For each factual claim in each answer, cite the source section number(s) in brackets:
   [3] or [5][6][7]. Every distinct fact must have a citation.
-  Do NOT use range notation like [5-7]; write [5][6][7] instead.
+  Do NOT use range notation like [5-7] or comma notation like [5, 6, 7];
+  write [5][6][7] instead.
 - Avoid yes/no questions; prefer open-ended questions requiring reasoning.
 
 Output format — a JSON array of objects:
@@ -335,30 +336,28 @@ EVIDENCE_VERIFICATION_PROMPT: str = """You are a literary evidence verification 
 
 You will receive:
 1. A CITED SECTIONS block containing the original text of all cited sections
-2. A QA ARRAY — JSON array of {book, question, answer} objects
+2. A QA ARRAY — JSON array of {book, question, answer} objects. Each answer has [N] citations.
 
 For EACH QA pair's answer:
 1. Read the factual claims and their [N] citations
 2. Find VERBATIM (exact, word-for-word) quotes from the corresponding original text sections that support each claim
-3. Add the evidence to that QA object
+3. Output each piece of evidence on its own line
 
 RULES:
 - Evidence MUST be exact quotes from the original text — no paraphrasing, no rewording
 - If a claim has support but no single sentence captures it, use the most relevant 1-3 consecutive sentences
-- If a claim CANNOT be supported, do NOT include evidence for it
+- If a claim CANNOT be supported, skip it — do not fabricate or stretch evidence
 - Be honest — do not fabricate or stretch evidence.
 
-Output format — a JSON array of objects, same as input but with an "evidence" field added:
-[
-    {
-        "book": "...",
-        "question": "...",
-        "answer": "...",
-        "evidence": ["verbatim quote 1", "verbatim quote 2"]
-    },
-    ...
-]
+Output format — one line per evidence item, using this exact format:
+{qa_index} || {verbatim evidence text}
 
-IMPORTANT: Escape any double quotes (") inside verbatim evidence with backslashes (\").
-If no evidence can be found for any QA pair, return the input array unchanged (without evidence field).
-Return ONLY the JSON array, no other text."""
+Where {qa_index} is the 0-based index of the QA pair in the input array.
+
+Examples:
+0 || 传统教育过于僵化，无法适应新时代的需求。
+0 || 这就是作者所说的"教育困境"。
+2 || 另一个相关段落的原文引用。
+
+If no evidence can be found for any QA pair, output nothing.
+Return ONLY the evidence lines, no other text."""

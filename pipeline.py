@@ -58,11 +58,18 @@ def sliding_window_chunks(text: str, window_size: int = WINDOW_SIZE,
     start = 0
     total = len(text)
     while start < total:
+        # 非首块：对齐到词边界（跳过开头被截断的半截词）
+        if chunks:
+            look = text[start:min(start + 80, total)]
+            m = re.search(r'\s', look)
+            if m:
+                start += m.start() + 1
+
         end = min(start + window_size, total)
         if end < total:
             search_from = max(start, end - 200)
             last_break = -1
-            for m in re.finditer(r'[.!?]', text[search_from:end]):
+            for m in re.finditer(r'[.!?。！？…]', text[search_from:end]):
                 last_break = search_from + m.end()
             if last_break > start:
                 end = last_break
@@ -270,8 +277,9 @@ def summarize_all_parallel(tasks: list[dict], workers: int = WORKERS,
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(process, t): t for t in pending}
             for f in as_completed(futures):
+                task = futures[f]
                 idx, _, _ = f.result()
-                print(f"  [{idx}/{total}] done", flush=True)
+                print(f"  [{task['section_idx']}/{task['section_total']}] done", flush=True)
 
     if resume_path:
         _save_resume(resume_path, done, results, all_triples)
@@ -632,28 +640,24 @@ def _parse_qa_pairs(answer: str) -> list[tuple[int, str, str]]:
         return []
 
 
+def _normalize_citations(text: str) -> str:
+    """统一引用格式：将 [46, 47] 转为 [46][47]，方便后续 regex 提取。
+
+    LLM 常输出逗号分隔的 [46, 47] 而非要求的 [46][47]，
+    此函数在提取引用前做一次归一化。
+    """
+    # [num, num, ...] → [num][num]...
+    return re.sub(
+        r'\[(\d+(?:\s*,\s*\d+)+)\]',
+        lambda m: ''.join(f'[{x.strip()}]' for x in m.group(1).split(',')),
+        text,
+    )
+
+
 def _strip_section_refs(text: str) -> str:
     """去掉答案中的 [N] 引用标记，仅用于显示。"""
     return re.sub(r'\s*\[(\d+)\]', '', text).strip()
 
-
-def _group_evidence_by_q(qa_array_str: str) -> dict[int, list[str]]:
-    """从 JSON 格式的 QA 数组中提取 evidence 字段，按顺序分组。
-    返回 {index: [verbatim_quote, ...]}"""
-    by_q: dict[int, list[str]] = {}
-    try:
-        data = json.loads(qa_array_str)
-        if not isinstance(data, list):
-            data = [data]
-        for i, item in enumerate(data):
-            ev = item.get("evidence", [])
-            if isinstance(ev, str):
-                ev = [ev]
-            if ev:
-                by_q[i + 1] = ev
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return by_q
 
 
 def _is_auto_qa_answer(answer: str) -> bool:
@@ -688,10 +692,10 @@ def _verify_evidence(answer: str, chunk_registry: dict,
 
     cited: set[int] = set()
     for qa in qa_list:
-        a_text = _get_ans(qa)
+        a_text = _normalize_citations(_get_ans(qa))
         for m in re.finditer(r'\[(\d+)\]', a_text):
             s = int(m.group(1))
-            if 1 <= s <= len(chunk_registry) * 2:
+            if 1 <= s <= len(chunk_registry):
                 cited.add(s)
 
     if not cited:
@@ -714,7 +718,7 @@ def _verify_evidence(answer: str, chunk_registry: dict,
 
     cited_sections_text = "\n\n---\n\n".join(cited_texts)
 
-    # 3. 调用 LLM 在原 JSON 上补充 evidence 字段
+    # 3. 调用 LLM 获取 evidence（输出简单行格式，无 JSON 转义问题）
     msgs = [
         {"role": "system", "content": EVIDENCE_VERIFICATION_PROMPT},
         {"role": "user", "content": (
@@ -726,14 +730,35 @@ def _verify_evidence(answer: str, chunk_registry: dict,
     try:
         result_text = _call_model(msgs, MAX_TOKENS_ANSWER)
         cleaned = _strip_code_fence(result_text)
-        enriched = json.loads(cleaned)
     except Exception as e:
-        print(f"  [Evidence] 验证失败: {e}")
+        print(f"  [Evidence] 调用失败: {e}")
         return answer, {}
 
-    per_q = _group_evidence_by_q(cleaned)
-    total_ev = sum(len(v) for v in per_q.values())
+    # 4. 解析行格式：idx || evidence_text
+    per_q_evidence: dict[int, list[str]] = {}
+    for line in cleaned.strip().split("\n"):
+        line = line.strip()
+        if not line or " || " not in line:
+            continue
+        idx_str, ev_text = line.split(" || ", 1)
+        try:
+            idx = int(idx_str.strip())
+        except ValueError:
+            continue
+        ev = ev_text.strip()
+        if ev:
+            per_q_evidence.setdefault(idx, []).append(ev)
+
+    total_ev = sum(len(v) for v in per_q_evidence.values())
     print(f"  [Evidence] 验证完成, {total_ev} 条证据")
+
+    # 5. 程序化合并 evidence 到原 JSON，无转义风险
+    enriched = []
+    for i, item in enumerate(qa_list):
+        new_item = dict(item)
+        new_item["evidence"] = per_q_evidence.get(i, [])
+        enriched.append(new_item)
+    enriched_json = json.dumps(enriched, ensure_ascii=False, indent=2)
 
     # ── 软校验：检查每条 evidence 在原文中是否有匹配 ──
     low_conf: list[tuple[int, int, str, float]] = []  # (qa_idx, ev_idx, snippet, score)
@@ -741,7 +766,7 @@ def _verify_evidence(answer: str, chunk_registry: dict,
         re.sub(r'\[(\d+)\] \(.*?\)\n', '', s)
         for s in cited_texts
     )
-    for q_idx, ev_list in per_q.items():
+    for q_idx, ev_list in per_q_evidence.items():
         for ev_i, ev_text in enumerate(ev_list):
             conf = _evidence_confidence(ev_text, combined_src)
             if conf < 0.5:
@@ -770,12 +795,13 @@ def _verify_evidence(answer: str, chunk_registry: dict,
                 f.write(f"  Evidence: {snippet}\n\n")
         print(f"  [Evidence] 审计报告: {audit_path}")
 
-    return cleaned, per_q
+    return enriched_json, per_q_evidence
 
 
-def _save_triples_csv(triples: list[dict]) -> str:
+def _save_triples_csv(triples: list[dict], out_dir: str | None = None) -> str:
     """保存三元组到 CSV 文件"""
-    out_dir = os.path.join(os.path.dirname(__file__), "output")
+    if out_dir is None:
+        out_dir = os.path.join(os.path.dirname(__file__), "output")
     os.makedirs(out_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(out_dir, f"triples_{ts}.csv")
@@ -802,7 +828,9 @@ def process_books(selected_names: list[str],
     all_tasks = []
     total_windows = 0
     out_dir = os.path.join(os.path.dirname(__file__), "output")
-    os.makedirs(out_dir, exist_ok=True)
+    run_ts = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(out_dir, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
 
     # 题型配置（override_prompts 优先，用于 notebook 调试时不改 question_types.py）
     if override_prompts:
@@ -939,15 +967,6 @@ def process_books(selected_names: list[str],
                 else:
                     all_qa_pairs.append(parsed)
                 print(f"  -> {len(parsed) if isinstance(parsed, list) else 1} QA pairs generated")
-
-                # 保存单本书的 JSON
-                qa_items = parsed if isinstance(parsed, list) else [parsed]
-                book_ts = time.strftime("%Y%m%d_%H%M%S")
-                book_safe = book_name.replace(".cleaned.txt", "").replace(" ", "_")
-                book_path = os.path.join(out_dir, f"result_{book_safe}_{book_ts}.json")
-                with open(book_path, "w", encoding="utf-8") as f:
-                    json.dump(qa_items, f, ensure_ascii=False, indent=2)
-                print(f"  -> Saved: {os.path.basename(book_path)}")
             except json.JSONDecodeError as e:
                 print(f"  [Warning] {book_name}: QA result parsing failed ({e}), skipped.")
 
@@ -961,11 +980,11 @@ def process_books(selected_names: list[str],
     # 保存三元组 CSV
     csv_path = None
     if all_triples:
-        csv_path = _save_triples_csv(all_triples)
+        csv_path = _save_triples_csv(all_triples, out_dir=run_dir)
 
     # 保存 Chunk Registry
     ts = time.strftime("%Y%m%d_%H%M%S")
-    registry_path = os.path.join(out_dir, f"chunk_registry_{ts}.json")
+    registry_path = os.path.join(run_dir, f"chunk_registry_{ts}.json")
     # 保存时去掉原文 text 以减少体积（仅保留 start/end/book 用于追溯）
     registry_slim = {}
     for idx, entry in chunk_registry.items():
@@ -984,19 +1003,39 @@ def process_books(selected_names: list[str],
     per_q_evidence: dict[int, list[str]] = {}
     if ENABLE_EVIDENCE_VERIFICATION and answer.strip():
         print(f"  Verifying evidence from original text...")
-        evidence_text, per_q_evidence = _verify_evidence(answer, chunk_registry, question, out_dir=out_dir)
+        evidence_text, per_q_evidence = _verify_evidence(answer, chunk_registry, question, out_dir=run_dir)
 
     # 格式化最终输出：evidence 验证成功则用补充后的 JSON
     final_json = evidence_text if evidence_text and per_q_evidence else answer
-    # 去掉 answer 中的 [N] 引用，并确保每个 QA 项都有 evidence 字段
+    # 预处理：从原始 answer（含 [N] 引用）提取每个 QA 的上下文 chunk 原文
+    context_per_qa: list[list[str]] = []
+    try:
+        raw_qas = json.loads(answer)
+        if isinstance(raw_qas, list):
+            for item in raw_qas:
+                ans_text = _normalize_citations(item.get("answer") or item.get("response") or "")
+                refs = sorted(set(int(m) for m in re.findall(r'\[(\d+)\]', ans_text)))
+                # 过滤越界引用（LLM 可能输出不存在的 section 号）
+                refs = [r for r in refs if r in chunk_registry]
+                chunks = []
+                for sec in refs:
+                    if sec in chunk_registry:
+                        chunks.append(chunk_registry[sec]["text"])
+                context_per_qa.append(chunks)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    # 去掉 answer 中的 [N] 引用，并确保每个 QA 项都有 evidence / context 字段
     try:
         parsed = json.loads(final_json)
         if isinstance(parsed, list):
-            for item in parsed:
+            for i, item in enumerate(parsed):
                 if "answer" in item:
                     item["answer"] = _strip_section_refs(item["answer"])
                 if "answer" in item and "evidence" not in item:
                     item["evidence"] = []
+                if "answer" in item:
+                    item["context"] = context_per_qa[i] if i < len(context_per_qa) and context_per_qa[i] else []
                 if "book" in item:
                     # LLM 可能输出文件名或真实书名，统一修正为 `book_titles` 中的值
                     raw = item["book"]
@@ -1010,6 +1049,7 @@ def process_books(selected_names: list[str],
             parsed["answer"] = _strip_section_refs(parsed["answer"])
             if "evidence" not in parsed:
                 parsed["evidence"] = []
+            parsed["context"] = context_per_qa[0] if context_per_qa and context_per_qa[0] else []
             if "book" in parsed:
                 raw = parsed["book"]
                 for fname, title in book_titles.items():
@@ -1025,7 +1065,7 @@ def process_books(selected_names: list[str],
     # 保存最终 JSON 到 output/
     ts = time.strftime("%Y%m%d_%H%M%S")
     suffix = type_label.replace(" ", "_")
-    result_path = os.path.join(out_dir, f"result_{suffix}_{ts}.json")
+    result_path = os.path.join(run_dir, f"result_{suffix}_{ts}.json")
     with open(result_path, "w", encoding="utf-8") as f:
         f.write(answer_with_evidence.strip() + "\n")
     print(f"  Result saved: {result_path}")
@@ -1045,6 +1085,7 @@ def process_books(selected_names: list[str],
         "triples_count": len(all_triples),
         "triples_csv": csv_path,
         "registry_path": registry_path,
+        "run_dir": run_dir,
     }
 
 
@@ -1181,10 +1222,7 @@ def interactive():
     print(f"Time: {result['total_time']:.0f}s | Windows: {result['total_windows']} | Triples: {result.get('triples_count', 0)}")
 
     # 日志文件，供人工查阅
-    out_dir = os.path.join(os.path.dirname(__file__), "output")
-    os.makedirs(out_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(out_dir, f"result_{ts}.log")
+    log_path = os.path.join(result["run_dir"], f"result.log")
     with open(log_path, "w", encoding="utf-8") as f:
         f.write(f"Question type: {type_cfg['label']}\n")
         f.write(f"Workers: {WORKERS}\n")
