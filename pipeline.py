@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 from config import (
-    API_BASE, API_KEY, MODEL, DATA_DIR,
+    API_BASE, API_KEY, MODEL, SUMMARY_MODEL, QA_MODEL, DATA_DIR,
     WINDOW_SIZE, OVERLAP, STRIDE,
     WORKERS, MAX_TOKENS_SUMMARIZE, MAX_TOKENS_ANSWER, MAX_RETRIES, MAX_ITERATIONS,
     API_MAX_RETRIES, API_RETRY_BASE_DELAY,
@@ -88,14 +88,16 @@ def sliding_window_chunks(text: str, window_size: int = WINDOW_SIZE,
 
 # ============ 模型调用 ============
 
-def _call_model(messages: list, max_tokens: int) -> str:
+def _call_model(messages: list, max_tokens: int, model: str | None = None) -> str:
     """调用 LLM，带指数退避重试。
     重试次数由 config.py 中的 API_MAX_RETRIES 控制。
+    model 参数覆盖 config.MODEL（用于分配不同角色到不同模型）。
     """
+    chosen = model or MODEL
     for attempt in range(API_MAX_RETRIES + 1):
         try:
             resp = client.chat.completions.create(
-                model=MODEL,
+                model=chosen,
                 messages=messages,
                 temperature=0.3,
                 max_tokens=max_tokens,
@@ -160,7 +162,7 @@ def _summarize_chunk(window_text: str, book_name: str,
         {"role": "system", "content": prompt},
         {"role": "user", "content": f"[{book_name} | {idx}/{total}]\n{window_text}"},
     ]
-    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
+    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE, SUMMARY_MODEL)
     return r.strip() if r else "[summary unavailable]"
 
 
@@ -171,7 +173,7 @@ def _extract_triples(summary: str, window_text: str) -> list[tuple[str, str, str
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Summary:\n{summary}\n\nOriginal Text:\n{window_text}"},
     ]
-    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
+    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE, SUMMARY_MODEL)
     return _parse_triples_block(r)
 
 
@@ -183,7 +185,7 @@ def _validate_triples(triples: list[tuple[str, str, str]],
         {"role": "system", "content": VALIDATE_TRIPLES_PROMPT},
         {"role": "user", "content": f"Original Text:\n{window_text}\n\nTriples to validate:\n{triples_text}"},
     ]
-    r = _call_model(msgs, max(512, MAX_TOKENS_SUMMARIZE // 2))
+    r = _call_model(msgs, max(512, MAX_TOKENS_SUMMARIZE // 2), SUMMARY_MODEL)
     return _parse_verdict(r)
 
 
@@ -197,7 +199,7 @@ def _revise_triples(summary: str, window_text: str,
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Summary:\n{summary}\n\nOriginal Text:\n{window_text}\n\nYour previous triples:\n{triples_text}\n\nReviewer feedback:\n{feedback}"},
     ]
-    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE)
+    r = _call_model(msgs, MAX_TOKENS_SUMMARIZE, SUMMARY_MODEL)
     revised = _parse_triples_block(r)
     return revised if revised else triples
 
@@ -387,7 +389,7 @@ def _canonicalize_entities(triples: list[dict]) -> tuple[list[dict], dict[str, s
 
     mapping: dict[str, str] = {}
     try:
-        response = _call_model(msgs, 4096)
+        response = _call_model(msgs, 4096, QA_MODEL)
         groups = re.findall(r'\[GROUP\]\s*(.*?)\s*\[/GROUP\]', response, re.DOTALL | re.IGNORECASE)
         for group in groups:
             lines = [l.strip() for l in group.strip().split('\n') if l.strip()]
@@ -763,7 +765,7 @@ def _verify_evidence(answer: str, chunk_registry: dict,
         ]
 
         try:
-            result_text = _call_model(msgs, MAX_TOKENS_ANSWER)
+            result_text = _call_model(msgs, MAX_TOKENS_ANSWER, QA_MODEL)
             cleaned = _strip_code_fence(result_text)
         except Exception as e:
             print(f"  [Evidence] Q{i} 调用失败: {e}")
@@ -923,7 +925,7 @@ def process_books(selected_names: list[str],
             {"role": "user", "content": user_content},
         ]
         t0 = time.time()
-        answer = _strip_code_fence(_call_model(answer_messages, MAX_TOKENS_ANSWER))
+        answer = _strip_code_fence(_call_model(answer_messages, MAX_TOKENS_ANSWER, QA_MODEL))
         answer_time = time.time() - t0
         all_triples_collected = all_triples
     else:
@@ -978,7 +980,7 @@ def process_books(selected_names: list[str],
                 {"role": "system", "content": qa_prompt},
                 {"role": "user", "content": user_content},
             ]
-            book_result = _strip_code_fence(_call_model(msgs, MAX_TOKENS_ANSWER))
+            book_result = _strip_code_fence(_call_model(msgs, MAX_TOKENS_ANSWER, QA_MODEL))
             book_result = _repair_json(book_result)
             try:
                 parsed = json.loads(book_result)

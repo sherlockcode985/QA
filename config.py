@@ -9,7 +9,9 @@ import os
 # ============ API 配置 ============
 API_BASE = "https://api.v3.cm/v1"
 API_KEY = os.environ.get("API_KEY", "sk-7UYrjDTvNGkCiSof5bAb604870C1401b88Ac44FfF4C569Cc")
-MODEL = "gemini-2.5-pro"
+MODEL = "gemini-2.5-pro"             # 未指定角色时的默认模型
+SUMMARY_MODEL = "qwen3.5-flash"      # 窗口总结用（轻量模型）
+QA_MODEL = "claude-sonnet-5"         # 出题/验证用（强推理模型）
 DATA_DIR = os.path.join(os.path.dirname(__file__), "books", "train")
 
 # ============ 滑动窗口 ============
